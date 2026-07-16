@@ -1,6 +1,6 @@
 ---
 name: paper-citation-researcher
-description: Investigate high-value citations to one or more academic papers, focusing on Turing Award and other elite-prize recipients, academy members, Royal Society Fellows, verified IEEE Fellows, and authors affiliated with major international technology companies. Use when Codex must merge Google Scholar/Semantic Scholar/OpenAlex evidence with user-provided citation PDFs or Markdown, resolve names conservatively, and deliver one detailed worksheet per target paper rather than a general author-ranking report.
+description: Investigate high-value citations to one or more academic papers and generate evidence-backed Excel, HTML, and Chinese PDF reports. Focus on Turing Award and other elite-prize recipients, academy members, Royal Society Fellows, verified IEEE Fellows, positive technical assessments, and authors affiliated with major international technology companies. Use when Codex must merge Google Scholar/Semantic Scholar/OpenAlex evidence with user-provided citation PDFs or Markdown, resolve names conservatively, deliver one detailed worksheet per target paper, or produce a polished high-value citation impact PDF.
 ---
 
 # Paper Citation Researcher
@@ -21,6 +21,7 @@ Use this skill only for focused high-value citation research. Do not make a broa
 7. Report the exact citing-paper title for every retained person or company. Include evidence URLs/local paths, author ID when available, affiliation, honor, and a confidence or identity note. Add a `homepage/profile details` field using an identity-verified personal, university, organization, Google Scholar, Semantic Scholar, OpenAlex, or authoritative biographical page; leave it blank when no verified URL exists.
 8. For multiple targets, write one worksheet per target paper plus a short overview and an unmatched-files worksheet. Do not place all target details into one combined sheet.
 9. Do not download and analyze every citing PDF by default. Download only retained high-value citing papers when body-context evidence is requested or needed to resolve ambiguity.
+10. When a formal Chinese PDF is requested, convert the verified retained records to `references/report-data-schema.md`, validate the JSON, render the PDF, then inspect rendered pages before delivery.
 
 ## High-Value Reporting Rules
 
@@ -40,6 +41,15 @@ Run the full workflow:
 ```powershell
 python scripts/paper_citation_researcher.py run --paper "Attention Is All You Need" --output ".\citation-output" --max-papers 1000 --browser edge --scholar-locale zh-CN --download-workers 4
 ```
+
+Generate the formal Chinese PDF after creating the verified report JSON:
+
+```powershell
+python scripts/validate_report_data.py .\output\report.json
+python scripts/render_report.py .\output\report.json .\output\pdf\citation-impact-report.pdf
+```
+
+Render the PDF to images with Poppler (`pdftoppm -png`) or an equivalent renderer and inspect every page for clipped tables, overlaps, broken Chinese glyphs, and unreadable URLs. Do not deliver an uninspected PDF.
 
 Run phases separately:
 
@@ -152,6 +162,7 @@ The output directory contains:
 - `author_profile_cache.json`: cached Google Scholar and Semantic Scholar author profile lookups.
 - `wikipedia_profile_cache.json`: cached Wikipedia/Wikidata enrichment lookups.
 - `pdfs/`: downloaded open-access PDFs.
+- Formal-report mode also produces a validated UTF-8 JSON source and a Chinese PDF under the requested output path. Read `references/report-data-schema.md` before creating the JSON.
 
 `citation_report.xlsx` sheets:
 
