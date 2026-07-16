@@ -955,6 +955,254 @@ def s2_fetch_citations(
     return rows
 
 
+def openalex_get(session: requests.Session, url: str, params: Dict[str, Any] | None = None) -> requests.Response:
+    query = dict(params or {})
+    mailto = os.environ.get("OPENALEX_MAILTO", "").strip()
+    if mailto:
+        query.setdefault("mailto", mailto)
+    api_key = os.environ.get("OPENALEX_API_KEY", "").strip()
+    if api_key:
+        query.setdefault("api_key", api_key)
+    response = None
+    for attempt in range(6):
+        response = session.get(
+            url,
+            params=query,
+            headers={"User-Agent": "paper-citation-researcher/1.0 (https://github.com/mkldy12138/paper-citation-researcher)"},
+            timeout=45,
+        )
+        if response.status_code not in {429, 500, 502, 503, 504}:
+            response.raise_for_status()
+            return response
+        if response.status_code == 429 and "insufficient budget" in response.text.lower():
+            raise RuntimeError(
+                "OpenAlex API budget is exhausted. Set OPENALEX_API_KEY with available credits "
+                "or continue with the other citation sources; do not interpret this as zero citations."
+            )
+        retry_after = response.headers.get("Retry-After", "")
+        try:
+            delay = min(max(float(retry_after), 1.0), 20.0)
+        except ValueError:
+            delay = min(2 ** attempt, 20)
+        if attempt < 5:
+            time.sleep(delay)
+    assert response is not None
+    response.raise_for_status()
+    return response
+
+
+def openalex_resolve_paper(session: requests.Session, identifier: str) -> Dict[str, Any]:
+    if is_doi(identifier):
+        doi = clean_doi(identifier)
+        encoded = urllib.parse.quote(f"https://doi.org/{doi}", safe="")
+        response = openalex_get(session, f"https://api.openalex.org/works/{encoded}")
+        return response.json()
+
+    response = openalex_get(
+        session,
+        "https://api.openalex.org/works",
+        {"search": identifier, "per-page": 10},
+    )
+    candidates = response.json().get("results", [])
+    if not candidates:
+        raise RuntimeError(f"OpenAlex could not resolve target paper: {identifier}")
+    def score_work(work: Dict[str, Any]) -> float:
+        return SequenceMatcher(
+            None,
+            normalize_text(identifier),
+            normalize_text(work.get("title", "")),
+        ).ratio()
+
+    best = max(candidates, key=score_work)
+    score = score_work(best)
+    if score < 0.45:
+        titles = "; ".join(work.get("title", "") for work in candidates[:5])
+        raise RuntimeError(f"OpenAlex could not confidently resolve target paper: {identifier}; candidates: {titles}")
+    return best
+
+
+def openalex_fetch_citations(
+    session: requests.Session,
+    target: Dict[str, Any],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    target_id = str(target.get("id", "")).rsplit("/", 1)[-1]
+    if not target_id:
+        return []
+    rows: List[Dict[str, Any]] = []
+    cursor = "*"
+    while len(rows) < limit and cursor:
+        page_size = min(200, limit - len(rows))
+        response = openalex_get(
+            session,
+            "https://api.openalex.org/works",
+            {
+                "filter": f"cites:{target_id}",
+                "per-page": page_size,
+                "cursor": cursor,
+            },
+        )
+        payload = response.json()
+        works = payload.get("results", [])
+        if not works:
+            break
+        for work in works:
+            author_details = []
+            for authorship in work.get("authorships", []):
+                author = authorship.get("author") or {}
+                institutions = authorship.get("institutions") or []
+                author_details.append(
+                    {
+                        "name": author.get("display_name", ""),
+                        "authorId": str(author.get("id", "")).rsplit("/", 1)[-1],
+                        "institutions": [
+                            {
+                                "name": inst.get("display_name", ""),
+                                "id": inst.get("id", ""),
+                                "ror": inst.get("ror", ""),
+                                "country_code": inst.get("country_code", ""),
+                                "type": inst.get("type", ""),
+                            }
+                            for inst in institutions
+                        ],
+                    }
+                )
+            author_details = [item for item in author_details if item.get("name")]
+            primary = work.get("primary_location") or {}
+            source = primary.get("source") or {}
+            open_access = work.get("open_access") or {}
+            best_oa = work.get("best_oa_location") or {}
+            ids = work.get("ids") or {}
+            doi = str(ids.get("doi") or "").replace("https://doi.org/", "")
+            openalex_id = str(work.get("id", "")).rsplit("/", 1)[-1]
+            rows.append(
+                {
+                    "source_platforms": "openalex",
+                    "source_record_ids": f"openalex:{openalex_id}" if openalex_id else "",
+                    "citing_title": work.get("title") or "",
+                    "citing_authors": ", ".join(item["name"] for item in author_details),
+                    "citing_authors_json": json.dumps(author_details, ensure_ascii=False),
+                    "citing_author_ids": ";".join(item["authorId"] for item in author_details if item.get("authorId")),
+                    "publication_year": work.get("publication_year") or "",
+                    "venue": source.get("display_name") or "",
+                    "doi": doi,
+                    "url": primary.get("landing_page_url") or ids.get("openalex") or "",
+                    "pdf_url": primary.get("pdf_url") or "",
+                    "open_access_pdf_url": best_oa.get("pdf_url") or (primary.get("pdf_url") if open_access.get("is_oa") else "") or "",
+                    "citation_count": citation_count_or_zero(work.get("cited_by_count")),
+                    "semantic_scholar_paper_id": "",
+                    "google_scholar_cited_by_url": "",
+                    "arxiv_id": "",
+                    "acl_id": "",
+                    "abstract": "",
+                }
+            )
+            if len(rows) >= limit:
+                break
+        cursor = (payload.get("meta") or {}).get("next_cursor")
+        if len(works) < page_size:
+            break
+        time.sleep(0.15)
+    return rows
+
+
+def crossref_resolve_paper(session: requests.Session, identifier: str) -> Dict[str, Any]:
+    headers = {"User-Agent": "paper-citation-researcher/1.0 (https://github.com/mkldy12138/paper-citation-researcher)"}
+    if is_doi(identifier):
+        doi = clean_doi(identifier)
+        response = session.get(
+            f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}",
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json().get("message", {})
+    response = session.get(
+        "https://api.crossref.org/works",
+        params={"query.title": identifier, "rows": 10},
+        headers=headers,
+        timeout=30,
+    )
+    response.raise_for_status()
+    candidates = response.json().get("message", {}).get("items", [])
+    if not candidates:
+        raise RuntimeError(f"Crossref could not resolve target DOI: {identifier}")
+    def score_item(item: Dict[str, Any]) -> float:
+        title = (item.get("title") or [""])[0]
+        return SequenceMatcher(None, normalize_text(identifier), normalize_text(title)).ratio()
+    best = max(candidates, key=score_item)
+    if score_item(best) < 0.70 or not best.get("DOI"):
+        raise RuntimeError(f"Crossref could not confidently resolve target DOI: {identifier}")
+    return best
+
+
+def crossref_citing_metadata(session: requests.Session, doi: str) -> Dict[str, Any]:
+    headers = {"User-Agent": "paper-citation-researcher/1.0 (https://github.com/mkldy12138/paper-citation-researcher)"}
+    response = session.get(
+        f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}",
+        headers=headers,
+        timeout=30,
+    )
+    if not response.ok:
+        return {}
+    return response.json().get("message", {})
+
+
+def opencitations_fetch_citations(
+    session: requests.Session,
+    target: Dict[str, Any],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    target_doi = clean_doi(target.get("DOI", ""))
+    if not target_doi:
+        return []
+    response = session.get(
+        f"https://api.opencitations.net/index/v1/citations/{urllib.parse.quote(target_doi, safe='/')}",
+        headers={"User-Agent": "paper-citation-researcher/1.0"},
+        timeout=45,
+    )
+    response.raise_for_status()
+    links = response.json()[:limit]
+    rows = []
+    for index, link in enumerate(links):
+        doi = clean_doi(link.get("citing", ""))
+        metadata = crossref_citing_metadata(session, doi) if doi else {}
+        authors = []
+        for author in metadata.get("author", []) or []:
+            name = " ".join(filter(None, [author.get("given", ""), author.get("family", "")])).strip()
+            if name:
+                authors.append({"name": name, "authorId": author.get("ORCID", "")})
+        title = (metadata.get("title") or [""])[0]
+        venue = (metadata.get("container-title") or [""])[0]
+        date_parts = ((metadata.get("published") or {}).get("date-parts") or [[]])[0]
+        year = date_parts[0] if date_parts else link.get("creation", "")
+        rows.append(
+            {
+                "source_platforms": "opencitations",
+                "source_record_ids": f"opencitations:{link.get('oci', '')}",
+                "citing_title": title,
+                "citing_authors": ", ".join(a["name"] for a in authors),
+                "citing_authors_json": json.dumps(authors, ensure_ascii=False),
+                "citing_author_ids": ";".join(a["authorId"] for a in authors if a.get("authorId")),
+                "publication_year": year,
+                "venue": venue,
+                "doi": doi,
+                "url": metadata.get("URL") or (f"https://doi.org/{doi}" if doi else ""),
+                "pdf_url": "",
+                "open_access_pdf_url": "",
+                "citation_count": citation_count_or_zero(metadata.get("is-referenced-by-count")),
+                "semantic_scholar_paper_id": "",
+                "google_scholar_cited_by_url": "",
+                "arxiv_id": "",
+                "acl_id": "",
+                "abstract": metadata.get("abstract") or "",
+            }
+        )
+        if index and index % 20 == 0:
+            time.sleep(0.2)
+    return rows
+
+
 def create_webdriver(browser: str):
     from selenium import webdriver
 
@@ -2262,6 +2510,25 @@ def fetch_find_platform(
         target = s2_resolve_paper(session, paper, api_key)
         rows = s2_fetch_citations(session, target, max_papers, api_key)
         return platform, target, rows, {"rows": len(rows), "status": "ok"}
+    if platform == "openalex":
+        session = make_session()
+        target = openalex_resolve_paper(session, paper)
+        rows = openalex_fetch_citations(session, target, max_papers)
+        return platform, target, rows, {
+            "rows": len(rows),
+            "status": "ok",
+            "reported_cited_by_count": target.get("cited_by_count", ""),
+            "target_id": target.get("id", ""),
+        }
+    if platform == "opencitations":
+        session = make_session()
+        target = crossref_resolve_paper(session, paper)
+        rows = opencitations_fetch_citations(session, target, max_papers)
+        return platform, {}, rows, {
+            "rows": len(rows),
+            "status": "ok",
+            "target_doi": target.get("DOI", ""),
+        }
     if platform == "google-scholar":
         rows, diagnostics = google_scrape_citing(
             paper,
@@ -2295,7 +2562,11 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
     def handle_result(platform: str, platform_target: Dict[str, Any], platform_records: List[Dict[str, Any]], diagnostics: Dict[str, Any]) -> None:
         nonlocal target
         if platform_target:
-            target = platform_target
+            if platform == "semantic-scholar" or not target.get("paperId"):
+                target = {**target, **platform_target}
+            if platform == "openalex":
+                target["openalex_id"] = platform_target.get("id", "")
+                target["openalex_cited_by_count"] = platform_target.get("cited_by_count", "")
         records.extend(platform_records)
         platform_record_counts[platform] = len(platform_records)
         platform_stats[platform] = diagnostics or {"rows": len(platform_records)}
@@ -2365,6 +2636,7 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
     rows = merge_records(records)
     google_rows = sum(1 for row in rows if row_has_platform(row, "google-scholar"))
     semantic_rows = sum(1 for row in rows if row_has_platform(row, "semantic-scholar"))
+    openalex_rows = sum(1 for row in rows if row_has_platform(row, "openalex"))
     target_path = output / "target.json"
     citing_path = output / "citing_papers.csv"
     papers = clean_frame_for_report(pd.DataFrame(rows), PAPER_COLUMNS)
@@ -2382,6 +2654,7 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
         "find.google_scholar_attempted": "google-scholar" in platforms,
         "find.google_scholar.rows": google_rows,
         "find.semantic_scholar.rows": semantic_rows,
+        "find.openalex.rows": openalex_rows,
         "find.platform_record_counts_json": json.dumps(platform_record_counts, ensure_ascii=False),
     }
     if platform_errors:
@@ -2403,12 +2676,19 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
                 "find.google_scholar.events_json": json.dumps(google_stats.get("events", []), ensure_ascii=False),
             }
         )
+    successful_sources = sum(1 for platform in platforms if platform_record_counts.get(platform, 0) > 0)
+    minimum_source_success = max(1, numeric_arg(args, "minimum_source_success", 2, int))
+    note_payload["find.successful_source_count"] = successful_sources
+    note_payload["find.minimum_source_success"] = minimum_source_success
     require_google_failure = "google-scholar" in platforms and require_google_scholar and google_rows == 0
+    source_coverage_failure = successful_sources < minimum_source_success
     if hard_platform_failure:
         note_payload["find.status"] = "failed_all_platforms"
     elif require_google_failure:
         note_payload["find.status"] = "failed_require_google_scholar"
         note_payload["find.require_google_scholar_failure"] = "no_google_scholar_rows_collected"
+    elif source_coverage_failure:
+        note_payload["find.status"] = "failed_source_coverage"
     else:
         note_payload["find.status"] = "ok"
     notes = append_run_notes(
@@ -2436,6 +2716,11 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
         raise RuntimeError(
             "Google Scholar was required but no Google Scholar citing rows were collected. "
             f"Check {output / 'scholar_debug'} and the run_notes sheet for captcha/status details."
+        )
+    if source_coverage_failure:
+        raise RuntimeError(
+            f"Only {successful_sources} citation source(s) produced records; at least "
+            f"{minimum_source_success} are required. Check run_notes for source failures."
         )
     if hard_platform_failure:
         raise RuntimeError("; ".join(f"{item['platform']}: {item['error']}" for item in platform_errors))
@@ -5190,6 +5475,8 @@ def build_dashboard_payload(output: Path) -> Dict[str, Any]:
     has_author_files = not authors.empty or not notable.empty
     google_rows = int(papers["source_platforms"].fillna("").astype(str).str.contains("google-scholar", regex=False).sum())
     semantic_rows = int(papers["source_platforms"].fillna("").astype(str).str.contains("semantic-scholar", regex=False).sum())
+    openalex_rows = int(papers["source_platforms"].fillna("").astype(str).str.contains("openalex", regex=False).sum())
+    opencitations_rows = int(papers["source_platforms"].fillna("").astype(str).str.contains("opencitations", regex=False).sum())
     expert_status_series = (
         authors["expert_query_status"].fillna("").astype(str).str.strip()
         if not authors.empty and "expert_query_status" in authors
@@ -5198,6 +5485,8 @@ def build_dashboard_payload(output: Path) -> Dict[str, Any]:
     source_status = {
         "googleScholarRows": google_rows,
         "semanticScholarRows": semantic_rows,
+        "openAlexRows": openalex_rows,
+        "openCitationsRows": opencitations_rows,
         "googleScholarRawRows": run_note_values.get("find.google_scholar.raw_rows", ""),
         "googleScholarStatus": run_note_values.get("find.google_scholar.status", ""),
         "googleScholarPartialFailure": run_note_values.get("find.google_scholar.partial_failure", ""),
@@ -5250,6 +5539,8 @@ def build_dashboard_payload(output: Path) -> Dict[str, Any]:
             "hasAuthorFiles": bool(has_author_files),
             "googleScholarRows": google_rows,
             "semanticScholarRows": semantic_rows,
+            "openAlexRows": openalex_rows,
+            "openCitationsRows": opencitations_rows,
             "expertQueried": int((expert_status_series.ne("") & (expert_status_series != "not_queried_outside_expert_scope")).sum()) if len(expert_status_series) else 0,
         },
         "sourceStatus": source_status,
@@ -5542,7 +5833,7 @@ def dashboard_html(payload: Dict[str, Any]) -> str:
     function barChart(id,obj,limit=12){ const entries=Object.entries(obj).sort((a,b)=>b[1]-a[1]).slice(0,limit); const max=Math.max(1,...entries.map(([,v])=>v)); document.getElementById(id).innerHTML='<div class="bars">'+entries.map(([label,value],idx)=>`<div class="bar-row"><div class="bar-label" title="${esc(label)}">${esc(label)}</div><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3,value/max*100)}%;background:${colors[idx%colors.length]}"></div></div><div class="bar-value">${value}</div></div>`).join('')+'</div>'; }
     function fillSelect(id,label,values){ const el=document.getElementById(id); el.innerHTML=`<option value="">${esc(label)}</option>`+[...new Set(values.filter(Boolean))].sort().map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join(''); }
     function renderTarget(){ const t=data.target; document.getElementById('targetMeta').innerHTML=[`目标论文：${esc(t.title)}`,`年份：${esc(t.year)}`,`Semantic Scholar citationCount：${esc(t.citationCount)}`,t.doi?`DOI：${esc(t.doi)}`:'',t.arxiv?`arXiv：${esc(t.arxiv)}`:''].filter(Boolean).map(x=>`<span>${x}</span>`).join(''); }
-    function renderStats(){ const s=data.stats; const items=[['被引记录',s.citingRows,`${s.titleUniqueRows} 个标题去重后唯一项`],['Google Scholar',s.googleScholarRows||0,`${s.semanticScholarRows||0} 条含 Semantic Scholar 来源`],['PDF 下载成功',s.downloaded,`${s.downloadFailureRows ?? s.failed} 个未成功下载`],['可靠引用位置',s.locationRows,`覆盖 ${s.locatedPapers} 篇论文`]]; if(s.hasAuthorFiles){ items.push(['作者候选',s.authorRows||0,`${s.expertQueried||0} 人已查专家证据`],['高质量作者',s.highQualityScholars||0,`${s.notableCitingRows||0} 条核心引用记录`]); } items.push(['Positive 位置',s.positiveLocations,'关键词启发式标记']); document.getElementById('stats').innerHTML=items.map(([label,value,note])=>`<article class="stat"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div><div class="note">${esc(note)}</div></article>`).join(''); }
+    function renderStats(){ const s=data.stats; const items=[['被引记录',s.citingRows,`${s.titleUniqueRows} 个标题去重后唯一项`],['多源召回',s.googleScholarRows||0,`S2 ${s.semanticScholarRows||0} / OpenAlex ${s.openAlexRows||0} / OpenCitations ${s.openCitationsRows||0}`],['PDF 下载成功',s.downloaded,`${s.downloadFailureRows ?? s.failed} 个未成功下载`],['可靠引用位置',s.locationRows,`覆盖 ${s.locatedPapers} 篇论文`]]; if(s.hasAuthorFiles){ items.push(['作者候选',s.authorRows||0,`${s.expertQueried||0} 人已查专家证据`],['高质量作者',s.highQualityScholars||0,`${s.notableCitingRows||0} 条核心引用记录`]); } items.push(['Positive 位置',s.positiveLocations,'关键词启发式标记']); document.getElementById('stats').innerHTML=items.map(([label,value,note])=>`<article class="stat"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div><div class="note">${esc(note)}</div></article>`).join(''); }
     function parseCountMap(text){ if(!text) return {}; try{ const obj=JSON.parse(text); return obj&&typeof obj==='object'&&!Array.isArray(obj)?obj:{}; }catch(_){ return {}; } }
     function formatAuthorGsCounts(text){ const obj=parseCountMap(text); const matched=Number(obj.exact_name_paper_match||0)+Number(obj.initial_name_paper_match||0); const errors=Number(obj.error||0)+Number(obj.captcha_blocked_not_queried||0); const skipped=Number(obj.not_queried||0)+Number(obj.skipped_by_user||0); const other=Object.entries(obj).filter(([k])=>!['exact_name_paper_match','initial_name_paper_match','error','captcha_blocked_not_queried','not_queried','skipped_by_user'].includes(k)).map(([k,v])=>`${k} ${v}`).join('; '); const parts=[`matched ${matched}`,`errors ${errors}`,`skipped ${skipped}`]; if(other) parts.push(other); return Object.keys(obj).length?parts.join(' / '):''; }
     function meaningfulUrl(v){ const text=String(v||'').trim(); return !text||text==='data:,'||text.startsWith('data:')?'':text; }
@@ -5557,7 +5848,7 @@ def dashboard_html(payload: Dict[str, Any]) -> str:
       const authorProfileValue=authorSkip?'Skipped for this refresh':(authorCounts||'not available');
       const authorProfileNote=authorSkip?`${authorTotal||0} author profiles left to Google Scholar; citation counts use Semantic Scholar fallback.`:(authorPage||'Google Scholar author profile lookup diagnostics.');
       const gsNote=[`raw ${s.googleScholarRawRows||0}`,`captcha ${s.googleScholarCaptchaStatus||'unknown'}`,`attempted ${s.googleScholarAttempted||'unknown'}`,s.googleScholarStatus?`status ${s.googleScholarStatus}`:'',s.googleScholarPartialFailure?`partial: ${shortText(s.googleScholarPartialFailure,120)}`:''].filter(Boolean).join('; ');
-      const items=[['Google Scholar rows',s.googleScholarRows ?? 0,gsNote],['Semantic Scholar rows',s.semanticScholarRows ?? 0,`find status ${s.findStatus||'unknown'}`],['GS target',s.googleScholarTargetFound||'unknown',s.googleScholarTargetTitle||''],['Reported cited-by',s.googleScholarReportedCitedByCount||'',s.googleScholarTargetCitedByUrl||''],['Find browser PID',s.googleScholarBrowserPid||'',`captcha action ${s.scholarCaptchaAction||''}`],['Last GS page',s.googleScholarPageTitle||'',meaningfulUrl(s.googleScholarCurrentUrl)],['Require GS',String(s.requireGoogleScholar||false),errors],['Author GS browser',s.authorScholarBrowserStatus||'not_run',`captcha ${s.authorScholarCaptchaStatus||'unknown'}; cookies ${s.authorScholarCookieCount||0}; selected ${s.authorScholarSelectedCount||0}`],['Author GS profiles',authorProfileValue,authorProfileNote]];
+      const items=[['Google Scholar rows',s.googleScholarRows ?? 0,gsNote],['Semantic Scholar rows',s.semanticScholarRows ?? 0,`find status ${s.findStatus||'unknown'}`],['OpenAlex rows',s.openAlexRows ?? 0,'API budget failures remain visible'],['OpenCitations rows',s.openCitationsRows ?? 0,'metadata enriched through Crossref'],['GS target',s.googleScholarTargetFound||'unknown',s.googleScholarTargetTitle||''],['Reported cited-by',s.googleScholarReportedCitedByCount||'',s.googleScholarTargetCitedByUrl||''],['Find browser PID',s.googleScholarBrowserPid||'',`captcha action ${s.scholarCaptchaAction||''}`],['Last GS page',s.googleScholarPageTitle||'',meaningfulUrl(s.googleScholarCurrentUrl)],['Require GS',String(s.requireGoogleScholar||false),errors],['Author GS browser',s.authorScholarBrowserStatus||'not_run',`captcha ${s.authorScholarCaptchaStatus||'unknown'}; cookies ${s.authorScholarCookieCount||0}; selected ${s.authorScholarSelectedCount||0}`],['Author GS profiles',authorProfileValue,authorProfileNote]];
       document.getElementById('sourceStatus').innerHTML=`<div class="status-grid">${items.map(([label,value,note])=>`<div class="status-item"><div class="label">${esc(label)}</div><div class="status-value">${esc(value||'')}</div><div class="note">${esc(note||'')}</div></div>`).join('')}</div>`;
     }
     function renderPaperRows(){ const q=document.getElementById('paperSearch').value.toLowerCase(); const status=document.getElementById('statusFilter').value; const source=document.getElementById('sourceFilter').value; const rows=data.papers.filter(row=>{ const hay=[row.citing_title,row.citing_authors,row.venue,row.doi,row.url,row.abstract,row.reference_evidence,row.top_author_name,row.top_author_profile_url,row.top_author_homepage_url].join(' ').toLowerCase(); return (!q||hay.includes(q))&&(!status||row.analysis_status===status)&&(!source||row.source_platforms===source); }); document.getElementById('paperRows').innerHTML=rows.map(row=>`<tr><td>${extLink(row.url,row.citing_title||'(untitled)')}<div class="muted">${esc(row.citing_authors||'')}</div><div class="muted">${esc(row.venue||'')}</div>${row.abstract?`<div class="muted">${esc(shortText(row.abstract))}</div>`:''}</td><td>${esc(String(row.publication_year||'').replace(/\.0$/,''))}</td><td>${esc(row.citation_count||0)}</td><td>${esc(row.source_platforms)}</td><td><span class="pill ${pillClass(row.analysis_status)}">${esc(row.analysis_status||'not_analyzed')}</span><div class="muted">${esc(row.download_status||'')}</div></td><td>${esc(row.top_author_name||row.top_author_status||'')}<div class="muted">${esc(row.top_author_selected_citation_count||'')}</div>${row.top_author_profile_url?`<div>${extLink(row.top_author_profile_url,'profile')}</div>`:''}${row.top_author_homepage_url?`<div>${extLink(row.top_author_homepage_url,'homepage')}</div>`:''}</td><td>${esc(row.location_count||0)}<div class="muted">${esc(row.pages||'')}</div><div class="muted">${esc(row.reference_marker||'')}</div></td><td>${row.doi?`<div>DOI</div><div class="muted">${esc(row.doi)}</div>`:''}${row.url?`<div>${extLink(row.url,'URL')}</div>`:''}</td></tr>`).join(''); }
@@ -5734,7 +6025,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 def add_common_find_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--paper", required=True, help="Target paper title or DOI")
     parser.add_argument("--output", required=True, help="Output directory")
-    parser.add_argument("--platforms", default="google-scholar,semantic-scholar")
+    parser.add_argument("--platforms", default="google-scholar,semantic-scholar,openalex,opencitations")
     parser.add_argument("--max-papers", type=int, default=1000, help="Maximum citing papers per platform (default: 1000)")
     parser.add_argument("--browser", choices=["chrome", "edge", "firefox"], default="edge")
     parser.add_argument("--scholar-locale", default="zh-CN", help="Google Scholar UI locale for search/cited-by pages (default: zh-CN)")
@@ -5744,6 +6035,7 @@ def add_common_find_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--s2-api-key-env", default="SEMANTIC_SCHOLAR_API_KEY")
     parser.add_argument("--find-workers", type=int, default=2, help="Parallel platform workers for find; Google Scholar itself remains single-browser serial (default: 2)")
     parser.add_argument("--require-google-scholar", action="store_true", help="Fail the find/run if Google Scholar produces no citing rows")
+    parser.add_argument("--minimum-source-success", type=int, default=2, help="Minimum citation platforms that must return records (default: 2)")
     parser.add_argument("--scholar-captcha-action", choices=["wait", "fail"], default="wait", help="How to handle Google Scholar captcha pages (default: wait)")
     parser.add_argument("--scholar-captcha-timeout", type=float, default=600.0, help="Seconds to wait for manual Google Scholar captcha completion when action is wait (default: 600)")
     parser.add_argument("--export-legacy-csv", action="store_true", help="Also export legacy CSV/XLSX tables for debugging")
@@ -5751,8 +6043,8 @@ def add_common_find_args(parser: argparse.ArgumentParser) -> None:
 
 def add_common_author_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", required=True, help="Output directory containing citation_report.xlsx or legacy citing_papers.csv")
-    parser.add_argument("--author-top-n", type=int, default=20, help="Top authors to enrich with Wikipedia evidence (default: 20)")
-    parser.add_argument("--max-author-profiles", type=int, default=200, help="Maximum author profiles to query across Semantic Scholar and Google Scholar (default: 200)")
+    parser.add_argument("--author-top-n", type=int, default=100, help="Priority authors to enrich with roster and biographical evidence (default: 100)")
+    parser.add_argument("--max-author-profiles", type=int, default=1000, help="Maximum author profiles to query across Semantic Scholar and Google Scholar (default: 1000)")
     parser.add_argument("--browser", choices=["chrome", "edge", "firefox"], default="edge", help="Visible browser for Google Scholar author captcha verification (default: edge)")
     parser.add_argument("--scholar-locale", default="en", help="Google Scholar UI locale for author profile search (default: en)")
     parser.add_argument("--scholar-captcha-action", choices=["wait", "fail"], default="wait", help="How to handle Google Scholar author captcha pages (default: wait)")
@@ -5764,7 +6056,7 @@ def add_common_author_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--s2-api-key-env", default="SEMANTIC_SCHOLAR_API_KEY")
     parser.add_argument("--author-workers", type=int, default=4, help="Parallel Semantic Scholar author profile workers (default: 4)")
     parser.add_argument("--wiki-workers", type=int, default=2, help="Parallel Wikipedia/Wikidata profile workers (default: 2)")
-    parser.add_argument("--homepage-search-limit", type=int, default=50, help="Maximum expert-scope authors to search for personal/school homepages when profiles do not provide one (default: 50)")
+    parser.add_argument("--homepage-search-limit", type=int, default=250, help="Maximum expert-scope authors to search for personal/school homepages when profiles do not provide one (default: 250)")
     parser.add_argument("--author-quality-scope", choices=["high-value", "elite", "high-impact", "all-notable"], default="high-value", help="Core citation rows: elite awards, academy members, and verified IEEE Fellows by default")
     parser.add_argument("--export-legacy-csv", action="store_true", help="Also export legacy author CSV tables for debugging")
 
@@ -5810,11 +6102,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--download-workers", type=int, default=4, help="Parallel PDF download workers (default: 4)")
     run_p.add_argument("--context-lines", type=int, default=2)
     run_p.add_argument("--analysis-scope", choices=["all-contexts", "positive-only", "summary-only"], default="all-contexts")
-    run_p.add_argument("--author-top-n", type=int, default=20, help="Top authors to enrich with Wikipedia evidence (default: 20)")
-    run_p.add_argument("--max-author-profiles", type=int, default=200, help="Maximum author profiles to query across Semantic Scholar and Google Scholar (default: 200)")
+    run_p.add_argument("--author-top-n", type=int, default=100, help="Priority authors to enrich with roster and biographical evidence (default: 100)")
+    run_p.add_argument("--max-author-profiles", type=int, default=1000, help="Maximum author profiles to query across Semantic Scholar and Google Scholar (default: 1000)")
     run_p.add_argument("--author-workers", type=int, default=4, help="Parallel Semantic Scholar author profile workers (default: 4)")
     run_p.add_argument("--wiki-workers", type=int, default=2, help="Parallel Wikipedia/Wikidata profile workers (default: 2)")
-    run_p.add_argument("--homepage-search-limit", type=int, default=50, help="Maximum expert-scope authors to search for personal/school homepages when profiles do not provide one (default: 50)")
+    run_p.add_argument("--homepage-search-limit", type=int, default=250, help="Maximum expert-scope authors to search for personal/school homepages when profiles do not provide one (default: 250)")
     run_p.add_argument("--author-quality-scope", choices=["high-value", "elite", "high-impact", "all-notable"], default="high-value", help="Core citation rows: elite awards, academy members, and verified IEEE Fellows by default")
     run_p.add_argument("--skip-google-scholar-authors", action="store_true", help="Skip Google Scholar author profile queries during run")
     # --export-legacy-csv is added by add_common_find_args.

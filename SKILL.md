@@ -10,7 +10,7 @@ Use this skill only for focused high-value citation research. Do not make a broa
 ## Required Default Workflow
 
 1. Read every target paper from the supplied workbook or list and preserve target order.
-2. Discover citing papers through Google Scholar and Semantic Scholar. Record platform failures explicitly; never interpret an unavailable source as zero citations.
+2. Discover citing papers through Google Scholar, Semantic Scholar, OpenAlex, and OpenCitations/Crossref. Record platform failures explicitly; require at least two successful sources, and never interpret an unavailable source as zero citations.
 3. Inspect every user-provided citation PDF, Markdown, workbook, or exported report. Match it to a target by normalized title. Put unrelated files in an `unmatched citation files` table; never attach them to a similar target.
    - Remove report watermarks, repeated headers, page numbers, and extraction artifacts such as repeated `AMiner 亮点` before writing cells.
    - Parse and display the reported author, honor/title, h-index, citation count, institution, citing-paper title, and available citation context as separate fields. Never use `see PDF`, `见PDF`, or similar placeholders for information that exists in the source.
@@ -22,6 +22,7 @@ Use this skill only for focused high-value citation research. Do not make a broa
 8. For multiple targets, write one worksheet per target paper plus a short overview and an unmatched-files worksheet. Do not place all target details into one combined sheet.
 9. Do not download and analyze every citing PDF by default. Download only retained high-value citing papers when body-context evidence is requested or needed to resolve ambiguity.
 10. When a formal Chinese PDF is requested, convert the verified retained records to `references/report-data-schema.md`, validate the JSON, render the PDF, then inspect rendered pages before delivery.
+11. For AMiner-scale or exhaustive requests, read `references/quality-and-coverage-standard.md`, expand every citing author, complete at least two enrichment passes, and run the strict quality audit before rendering.
 
 ## High-Value Reporting Rules
 
@@ -33,6 +34,9 @@ Use this skill only for focused high-value citation research. Do not make a broa
 - Never claim Turing Award citations unless the citing author is a verified laureate and the citing-paper authorship is identity-resolved. Report zero explicitly when none are verified.
 - Add `confidence`, `confidence reason`, `homepage/profile`, `honor evidence`, `company-affiliation evidence`, exact citing-paper title, and citation context to every retained row.
 - For multi-paper delivery, create separate scholar and company worksheets for each target. Keep exactly one final workbook; preserve user source files, citation PDFs, and requested summary documents when cleaning intermediates.
+- Match detailed benchmark reports on search depth and per-person evidence density, not by padding the list. H-index alone never qualifies a person for the core table.
+- Decompose every retained row into five claims: citing-paper authorship, exact target citation, honor/company affiliation, homepage identity, and citation-context assessment. Store a verdict for each claim.
+- Repeat roster reverse-matching and unresolved-candidate searches until a final pass produces no new verified people. Record pass yield, coverage, and unresolved candidates.
 
 ## Quick Start
 
@@ -46,6 +50,7 @@ Generate the formal Chinese PDF after creating the verified report JSON:
 
 ```powershell
 python scripts/validate_report_data.py .\output\report.json
+python scripts/audit_report_quality.py .\output\report.json --strict
 python scripts/render_report.py .\output\report.json .\output\pdf\citation-impact-report.pdf
 ```
 
@@ -84,16 +89,20 @@ Required runtime setup:
 Optional configuration:
 
 - `SEMANTIC_SCHOLAR_API_KEY`: set this environment variable to use authenticated Semantic Scholar requests. Leave it unset for anonymous requests.
+- `OPENALEX_API_KEY`: set this when OpenAlex requires paid or prepaid API credits. Budget exhaustion must be recorded as a platform failure, not zero citations.
 - `--s2-api-key` / `--s2-api-key-env`: use these only when overriding the default API-key source.
 - `--scholar-locale`: defaults to `zh-CN` for paper search and `en` for author profile search.
 - `--max-papers`: defaults to `1000`; confirm this value at the start of each new target-paper topic.
 - `--find-workers`: defaults to `2`; runs independent source platforms in parallel. Google Scholar itself remains one browser session with serial pagination.
+- `--minimum-source-success`: defaults to `2`; fail high-coverage discovery when fewer than two platforms return records.
 - `--require-google-scholar`: fail `find`/`run` if Google Scholar produces no citing rows, while still writing failure diagnostics to `citation_report.xlsx`.
 - `--scholar-captcha-action wait|fail`: defaults to `wait`; when Google Scholar shows captcha, keep the visible browser open and wait for manual verification.
 - `--scholar-captcha-timeout`: defaults to `600` seconds; maximum wait time for manual Google Scholar verification.
 - `--author-workers`: defaults to `4`; controls parallel Semantic Scholar Author API profile queries.
 - `--wiki-workers`: defaults to `2`; controls parallel Wikipedia/Wikidata enrichment for top non-target authors.
-- `--homepage-search-limit`: defaults to `50`; for expert-scope authors without a known profile homepage, searches for likely personal/school homepages and extracts profile evidence.
+- `--author-top-n`: defaults to `100`; controls priority roster and biographical enrichment.
+- `--max-author-profiles`: defaults to `1000`; covers the complete citing-author pool for detailed investigations.
+- `--homepage-search-limit`: defaults to `250`; for expert-scope authors without a known profile homepage, searches for likely personal/school homepages and extracts profile evidence.
 - `--author-quality-scope`: defaults to `high-value`, so the core output includes verified elite-award recipients, academy members/Royal Society Fellows, and IEEE Fellows. Use `elite` to exclude IEEE Fellows, `high-impact` to add identity-verified metric-threshold authors, or `all-notable` only for debugging.
 - `--skip-google-scholar-authors`: optional refresh/debug flag. It preserves already cached Google Scholar author profiles and only marks uncached profiles as skipped.
 - `--export-legacy-csv`: debugging option that also writes old CSV/XLSX tables. Do not use it for normal runs.
@@ -126,19 +135,19 @@ When the user asks what can be changed, explain only the relevant phase:
 ## Behavior
 
 - Google Scholar uses Selenium. Captcha handling is explicit: by default `--scholar-captcha-action wait` keeps the visible browser open, shows a Windows popup when verification is detected, saves `scholar_debug/` URL/HTML/screenshot evidence, records status in `run_notes`, and waits up to `--scholar-captcha-timeout` seconds for manual verification. Use `--scholar-captcha-action fail` only for non-interactive diagnostic runs.
-- Google Scholar is enabled by default through `--platforms google-scholar,semantic-scholar`. Confirm actual use by checking dashboard data-source status, `run_notes` (`find.google_scholar.*`), or the `papers.source_platforms` values in `citation_report.xlsx`; rows containing `google-scholar` came from Google Scholar.
+- Google Scholar, Semantic Scholar, OpenAlex, and OpenCitations/Crossref are enabled by default. Confirm actual use through dashboard source status, `run_notes`, and `papers.source_platforms`; require at least two sources to return records.
 - Use `--require-google-scholar` when the report must include Google Scholar discovery. If Google Scholar is blocked or yields zero citing rows, the command fails after writing diagnostics and must not be treated as a complete Google Scholar investigation.
-- `find` can run Google Scholar and Semantic Scholar in parallel when both platforms are enabled. Do not open multiple Google Scholar browser sessions for the same run; Google Scholar pagination stays serial so target matching, cited-by pagination, and captcha handling remain reliable.
+- `find` runs independent sources in parallel. Do not open multiple Google Scholar browser sessions for the same run; Google Scholar pagination stays serial so target matching, cited-by pagination, and captcha handling remain reliable.
 - Google Scholar defaults to `--scholar-locale zh-CN` because cited-by pagination can expose different pages by locale; use `--scholar-locale en` only when needed.
 - Google Scholar target pages can report a larger cited-by count than the Next links expose. Read the reported cited-by count from the target page, then keep trying cited-by pages with `start += 10` until the reported count, `--max-papers`, or consecutive empty pages stop the run. Log when Google reports more citations than it exposes through result pages.
 - If Google Scholar target matching succeeds and some cited-by pages are already collected, a later pagination/captcha/driver interruption preserves the partial Google Scholar rows, records `partial_error` or `partial_captcha_blocked`, and continues downstream instead of discarding collected rows.
-- Google Scholar and Semantic Scholar citing-paper rows must always include `citation_count`: parse the source count when present, otherwise write `0` instead of leaving the field empty.
+- Citing-paper rows from every source must include `citation_count`: parse the source count when present, otherwise write `0` instead of leaving the field empty.
 - Semantic Scholar uses the Graph API and supports an optional API key. Leave `--s2-api-key` empty for anonymous requests, or use `--s2-api-key-env SEMANTIC_SCHOLAR_API_KEY` to enable authenticated requests later without changing workflows.
 - Resolve Semantic Scholar targets in this order: DOI lookup as `DOI:<doi>`, then `paper/search/match`, then normalized title search. Handle `search/match` responses that return either a paper object or `{"data": [...]}`.
 - Fetch Semantic Scholar citations from `/graph/v1/paper/{paperId}/citations` with nested `citingPaper.*` fields. Do not fetch citing papers by re-searching titles.
 - For Semantic Scholar 429/5xx responses, read `Retry-After`, use backoff, and include status, URL, and a short response-body excerpt in `platform_errors.semantic-scholar`.
 - `dedupe_key` in outputs always uses normalized title plus year. DOI, Semantic Scholar IDs, landing URLs, PDF URLs, OA PDF URLs, arXiv, and ACL links are internal duplicate-detection aliases.
-- When Google Scholar and Semantic Scholar return the same citing paper, Google Scholar display fields take priority while Semantic Scholar DOI/open-access metadata is retained.
+- When multiple sources return the same citing paper, Google Scholar display fields take priority while Semantic Scholar and OpenAlex IDs, DOI, author IDs, institutions, and open-access metadata are retained.
 - The `papers` sheet always includes both the display author string and structured author fields (`citing_authors_json`, `citing_author_ids`) when available. Google-only rows may have only parsed names.
 - The `authors` stage deduplicates authors by Semantic Scholar `authorId` first, then normalized name. It queries at most `--max-author-profiles` authors by default, prioritizing candidates with Semantic Scholar IDs, highly cited source papers, and repeated appearances. Semantic Scholar Author API lookups use `--author-workers` parallel workers.
 - Author ranking, high-quality-author detection, dashboard author charts, and each paper's `top_author_*` fields exclude all target-paper authors, using `authorId` first and normalized names as a fallback. Per-paper representative authors prefer quality tier before personal citation count.

@@ -57,7 +57,31 @@ def build(data, output):
     meta = [["作者", t.get("authors", "")], ["年份 / 期刊", f"{t.get('year','')} / {t.get('venue','')}"], ["DOI", t.get("doi", "")], ["检索日期", t.get("retrieved_at", "")], ["本次检索被引数", t.get("citation_count", "")]]
     table = Table([[Paragraph(esc(a), body), Paragraph(esc(b), body)] for a,b in meta], colWidths=[34*mm, 135*mm])
     table.setStyle(TableStyle([("BACKGROUND",(0,0),(0,-1),colors.HexColor("#E7F1F0")),("FONTNAME",(0,0),(-1,-1),"CN"),("GRID",(0,0),(-1,-1),0.35,colors.HexColor("#AAB7B8")),("VALIGN",(0,0),(-1,-1),"TOP"),("PADDING",(0,0),(-1,-1),6)]))
-    story += [table, Spacer(1, 8*mm), Paragraph("结论只收录身份能够可靠对应的高价值作者。中可信记录表示论文署名机构明确，但缺少独立个人履历佐证；低可信候选不进入主表。", body), PageBreak()]
+    story += [table, Spacer(1, 6*mm)]
+    if t.get("abstract"):
+        story += [Paragraph("论文摘要", h3), Paragraph(esc(t.get("abstract")), body), Spacer(1, 4*mm)]
+    coverage = data.get("coverage") or {}
+    if coverage:
+        coverage_rows = [
+            ["发现引用论文", coverage.get("discovered_unique_citing_papers", "")],
+            ["成功数据源", coverage.get("source_success_count", "")],
+            ["展开作者数", coverage.get("unique_citing_authors", "")],
+            ["核验候选数", coverage.get("high_value_candidates_reviewed", "")],
+            ["正文语境已核验", coverage.get("retained_with_verified_context", "")],
+            ["最终轮新增", coverage.get("new_verified_people_last_pass", "")],
+        ]
+        coverage_table = Table(
+            [[Paragraph(esc(a), small), Paragraph(esc(b), small)] for a, b in coverage_rows],
+            colWidths=[42*mm, 30*mm],
+        )
+        coverage_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#E7F1F0")),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#AAB7B8")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("PADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story += [Paragraph("检索覆盖", h3), coverage_table, Spacer(1, 5*mm)]
+    story += [Paragraph("结论只收录身份能够可靠对应的高价值作者。中可信记录表示论文署名机构明确，但缺少独立个人履历佐证；低可信候选不进入主表。", body), PageBreak()]
 
     def summary(rows, scholar=True):
         headers = ["姓名", "荣誉/企业", "机构", "引用论文", "可信度", "主页"]
@@ -78,10 +102,27 @@ def build(data, output):
             block = []
             label = r.get("honor") or r.get("company")
             block += [Paragraph(f"{idx}. {esc(r['name'])} - {esc(label)}", h3)]
-            fields = [("机构/署名", r.get("affiliation") or r.get("raw_affiliation")), ("可信度", f"{r['confidence'].upper()}：{r['confidence_reason']}"), ("主页", r.get("homepage") or "未找到可核验主页"), ("证据", "<br/>".join(r.get("honor_evidence") or r.get("affiliation_evidence") or []))]
+            metrics = []
+            if r.get("h_index") not in (None, ""):
+                metrics.append(f"h指数 {r.get('h_index')}")
+            if r.get("personal_citation_count") not in (None, ""):
+                metrics.append(f"个人引用 {r.get('personal_citation_count')}")
+            verdicts = r.get("claim_verdicts") or {}
+            verdict_text = "；".join(f"{k}={v}" for k, v in verdicts.items())
+            fields = [("机构/署名", r.get("affiliation") or r.get("raw_affiliation"))]
+            if metrics:
+                fields.append(("学术指标", "；".join(metrics)))
+            fields.extend([("可信度", f"{r['confidence'].upper()}：{r['confidence_reason']}"), ("五项核验", verdict_text or "未单独记录"), ("主页", r.get("homepage") or "未找到可核验主页"), ("证据", "<br/>".join(r.get("honor_evidence") or r.get("affiliation_evidence") or []))])
             for k,v in fields: block.append(Paragraph(f"<b>{esc(k)}：</b>{esc(v) if k != '证据' else v}", body))
             for p in r["citing_papers"]:
                 block.append(Paragraph(f"<b>具体引用论文：</b>{esc(p['title'])} ({esc(p.get('year'))}, {esc(p.get('venue'))})", body))
+                paper_metrics = []
+                if p.get("citation_count") not in (None, ""):
+                    paper_metrics.append(f"引文自身被引 {p.get('citation_count')} 次")
+                if p.get("target_citation_frequency") not in (None, ""):
+                    paper_metrics.append(f"该作者引用目标论文 {p.get('target_citation_frequency')} 次")
+                if paper_metrics:
+                    block.append(Paragraph(f"<b>引文指标：</b>{esc('；'.join(paper_metrics))}", body))
                 block.append(Paragraph(f"<b>论文链接：</b>{esc(p.get('url'))}", small))
                 status = {"verified":"正文引文已核验","reference-list-only":"仅参考文献表已核验","not-accessible":"全文未获取"}[p["context_status"]]
                 block.append(Paragraph(f"<b>引用位置：</b>{status}。{esc(p.get('context'))}", body))

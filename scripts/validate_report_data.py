@@ -5,6 +5,8 @@ from urllib.parse import urlparse
 
 ALLOWED_CONFIDENCE = {"high", "medium"}
 ALLOWED_CONTEXT = {"verified", "reference-list-only", "not-accessible"}
+ALLOWED_VERDICTS = {"supported", "partially-supported", "uncertain", "unsupported"}
+REQUIRED_CLAIMS = {"authorship", "target_citation", "honor_or_company", "homepage_identity", "context_assessment"}
 BAD_TEXT = ("见pdf", "自动解析", "未自动拆分", "未能唯一对应", "TODO")
 
 def is_url(value):
@@ -17,6 +19,7 @@ def main(path):
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     errors = []
     target = data.get("target", {})
+    high_coverage = bool(data.get("coverage"))
     for key in ("title", "retrieved_at", "sources"):
         if not target.get(key): errors.append(f"target.{key} is required")
     for group, label_key in (("scholars", "honor"), ("companies", "company")):
@@ -33,6 +36,18 @@ def main(path):
                 errors.append(f"{prefix}.homepage is not a valid URL")
             if not row.get("homepage") and "主页" not in row.get("confidence_reason", ""):
                 errors.append(f"{prefix} has no homepage; explain this in confidence_reason")
+            verdicts = row.get("claim_verdicts") or {}
+            if high_coverage and set(verdicts) != REQUIRED_CLAIMS:
+                errors.append(f"{prefix}.claim_verdicts must contain all five verification claims")
+            for claim, verdict in verdicts.items():
+                if claim not in REQUIRED_CLAIMS or verdict not in ALLOWED_VERDICTS:
+                    errors.append(f"{prefix}.claim_verdicts.{claim} is invalid")
+            if verdicts and (
+                verdicts.get("authorship") != "supported"
+                or verdicts.get("target_citation") != "supported"
+                or verdicts.get("honor_or_company") != "supported"
+            ):
+                errors.append(f"{prefix} cannot enter the main table without supported identity, citation, and honor/company claims")
             for j, paper in enumerate(row.get("citing_papers", []), 1):
                 if not paper.get("title"): errors.append(f"{prefix}.citing_papers[{j}].title is required")
                 if paper.get("context_status") not in ALLOWED_CONTEXT:
