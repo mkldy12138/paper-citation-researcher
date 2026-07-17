@@ -42,12 +42,14 @@ pdfmetrics.registerFont(TTFont("CN", str(FONT), subfontIndex=0))
 pdfmetrics.registerFont(TTFont("CN-Bold", str(BOLD), subfontIndex=0))
 
 def esc(v):
-    return str(v or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    value = "" if v is None else str(v)
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def build(data, output):
     styles = getSampleStyleSheet()
     body = ParagraphStyle("BodyCN", parent=styles["BodyText"], fontName="CN", fontSize=8.2, leading=13, textColor=colors.HexColor("#263238"))
     small = ParagraphStyle("SmallCN", parent=body, fontSize=7, leading=10)
+    table_header = ParagraphStyle("TableHeaderCN", parent=small, fontName="CN-Bold", textColor=colors.white)
     h1 = ParagraphStyle("H1CN", parent=styles["Title"], fontName="CN-Bold", fontSize=20, leading=28, textColor=colors.HexColor("#123B56"), alignment=TA_CENTER)
     h2 = ParagraphStyle("H2CN", parent=styles["Heading2"], fontName="CN-Bold", fontSize=13, leading=18, textColor=colors.HexColor("#0B6E69"), spaceBefore=8, spaceAfter=6)
     h3 = ParagraphStyle("H3CN", parent=h2, fontSize=10.5, leading=15, textColor=colors.HexColor("#123B56"))
@@ -88,7 +90,8 @@ def build(data, output):
         vals = [headers]
         for r in rows:
             vals.append([r["name"], r.get("honor") or r.get("company"), r.get("affiliation") or r.get("raw_affiliation"), "；".join(p["title"] for p in r["citing_papers"]), r["confidence"].upper(), r.get("homepage") or "未找到可核验主页"])
-        tab = Table([[Paragraph(esc(x), small) for x in row] for row in vals], repeatRows=1, colWidths=[19*mm,25*mm,31*mm,54*mm,17*mm,32*mm])
+        rendered = [[Paragraph(esc(x), table_header if row_index == 0 else small) for x in row] for row_index, row in enumerate(vals)]
+        tab = Table(rendered, repeatRows=1, colWidths=[19*mm,25*mm,31*mm,54*mm,17*mm,32*mm])
         tab.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#123B56")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTNAME",(0,0),(-1,0),"CN-Bold"),("GRID",(0,0),(-1,-1),0.3,colors.HexColor("#AAB7B8")),("VALIGN",(0,0),(-1,-1),"TOP"),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#F4F7F7")]),("PADDING",(0,0),(-1,-1),4)]))
         return tab
 
