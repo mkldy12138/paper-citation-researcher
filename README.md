@@ -12,11 +12,11 @@
 
 ## 特点
 
-- 合并 Google Scholar、Semantic Scholar、OpenAlex、OpenCitations/Crossref 与用户提供的引用 PDF/Markdown。
+- 默认合并 Semantic Scholar、OpenAlex、OpenCitations/Crossref 与用户提供的引用 PDF/Markdown；Google Scholar 改为显式启用。
 - 默认要求至少两个引用数据库成功，并覆盖最多1000名引用作者；不会只核验高引用论文的前几十名作者。
 - 执行两轮以上候选核验和名册反向匹配，直到最后一轮不再发现新的高价值作者。
 - 输出覆盖率、作者展开率、全文获取率、正文评价率、主页率和未解决候选，避免用“查到多少算多少”冒充完整调查。
-- 使用有上限的分阶段并发：四个来源同时检索，Crossref元数据、作者画像、主页、PDF下载和正文分析分别并发；每阶段结束后统一汇总再进入下一阶段。
+- 使用有上限的分阶段并发：三个默认来源同时检索，Crossref元数据、作者画像、主页、PDF下载和正文分析分别并发；每阶段结束后统一汇总再进入下一阶段。
 - 来源遇到429、临时5xx或超时时立即隔离；若同一目标存在近期成功快照，则以 `cached_fallback` 明示回退，避免坏网络覆盖好结果。
 - 优先保留有正文证据的正面评价，并区分正面评价、方法采用/比较和普通提及。
 - 使用作者ID、机构、研究方向、论文署名和官方主页进行保守身份解析。
@@ -53,9 +53,7 @@ python scripts/paper_citation_researcher.py run `
   --paper "Point Transformer V3: Simpler, Faster, Stronger" `
   --output ".\citation-output" `
   --max-papers 1000 `
-  --browser edge `
-  --scholar-locale zh-CN `
-  --find-workers 4 `
+  --find-workers 3 `
   --metadata-workers 12 `
   --metadata-rps 5 `
   --author-workers 8 `
@@ -75,11 +73,12 @@ python scripts/paper_citation_researcher.py dashboard --output ".\out"
 python scripts/paper_citation_researcher.py report --output ".\out" --strict-report
 ```
 
-用户给出了 Google Scholar 论文详情页时，直接指定它以避免同题版本匹配失败：
+Google Scholar 默认关闭。确需使用时显式加入来源；用户给出了论文详情页时，可同时指定它以避免同题版本匹配失败：
 
 ```powershell
 python scripts/paper_citation_researcher.py find `
   --paper "<论文题名>" --output ".\out" `
+  --platforms "google-scholar,semantic-scholar,openalex,opencitations" `
   --scholar-target-url "https://scholar.google.com/citations?...&citation_for_view=..."
 ```
 
@@ -96,7 +95,7 @@ PDF输入JSON格式见 `references/report-data-schema.md`。生成后应使用 P
 
 需要达到详细 AMiner 报告的信息量时，使用默认的三源检索与高覆盖参数，并遵循 `references/quality-and-coverage-standard.md`。信息量对齐的是检索深度和逐人证据密度，不会用仅有高 h 指数、但不属于院士/Fellow/顶级奖项/头部企业类别的普通作者凑数。
 
-Google Scholar 出现验证码时，默认保留浏览器窗口等待人工验证。若任务要求 Google Scholar 必须成功，增加 `--require-google-scholar`。
+作者 Google Scholar 画像也默认关闭；需要时添加 `--google-scholar-authors`。若任务要求 Google Scholar 引用发现必须成功，添加 `--require-google-scholar`，该参数会自动启用来源。
 
 并发架构、阶段屏障和限流调参见 `references/concurrency-model.md`。Excel、JSON、HTML和PDF始终在汇总阶段单线程写入，避免文件竞争。
 
@@ -153,8 +152,8 @@ python scripts/benchmark_author_coverage.py `
 ## 环境要求
 
 - Python 3.10+
-- Edge、Chrome 或 Firefox 浏览器
-- 可访问 Google Scholar、Semantic Scholar、OpenAlex、出版社和机构官网的网络环境
+- 可访问 Semantic Scholar、OpenAlex、OpenCitations、出版社和机构官网的网络环境
+- 仅在显式启用 Google Scholar 时需要 Edge、Chrome 或 Firefox 浏览器
 - Python依赖见 `requirements.txt`
 - Linux或macOS需要安装 Noto CJK/PingFang 等中文字体；也可通过 `CITATION_REPORT_FONT` 和 `CITATION_REPORT_BOLD_FONT` 指定字体文件。
 - OpenAlex当前可能要求可用额度；通过 `OPENALEX_API_KEY` 提供密钥。无额度时会明确记录平台失败并继续其他来源，不会报告为0条引用。

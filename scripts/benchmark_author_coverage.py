@@ -16,6 +16,16 @@ def token_overlap(left, right):
     return len(a & b) / len(a) if a else 0.0
 
 
+def name_equivalent(left, right):
+    left_normalized = normalize(left)
+    right_normalized = normalize(right)
+    if left_normalized == right_normalized:
+        return True
+    left_tokens = left_normalized.split()
+    right_tokens = right_normalized.split()
+    return len(left_tokens) >= 2 and sorted(left_tokens) == sorted(right_tokens)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Measure verified high-value author recall against a curated reference set")
     parser.add_argument("--workbook", required=True)
@@ -27,7 +37,7 @@ def main():
     gold = json.loads(Path(args.gold).read_text(encoding="utf-8"))
     results = []
     for identity in gold.get("identities", []):
-        same_name = [row for row in authors if normalize(row.get("name")) == normalize(identity.get("name"))]
+        same_name = [row for row in authors if name_equivalent(row.get("name"), identity.get("name"))]
         ranked = sorted(
             same_name,
             key=lambda row: token_overlap(
@@ -57,7 +67,16 @@ def main():
                 )
             ),
         ) if best else 0.0
-        identity_matched = bool(best) and (len(same_name) == 1 or affiliation_score >= 0.5)
+        name_found = bool(best)
+        reference_affiliation = normalize(identity.get("affiliation"))
+        identity_matched = bool(
+            best
+            and (
+                affiliation_score >= 0.5
+                if reference_affiliation
+                else len(same_name) == 1
+            )
+        )
         profile_evidence = any(
             best.get(field)
             for field in (
@@ -77,15 +96,18 @@ def main():
         results.append(
             {
                 **identity,
+                "name_found": name_found,
                 "identity_matched": identity_matched,
                 "affiliation_score": round(affiliation_score, 3),
                 "verified_evidence_complete": verified,
                 "matched_author_key": best.get("author_key", ""),
+                "matched_source_name": best.get("name", ""),
                 "matched_quality_tier": best.get("author_quality_tier", ""),
             }
         )
 
     total = len(results)
+    name_hits = sum(item["name_found"] for item in results)
     identity_hits = sum(item["identity_matched"] for item in results)
     verified_hits = sum(item["verified_evidence_complete"] for item in results)
     report = {
@@ -93,6 +115,8 @@ def main():
         "formula": "reference identities with citing paper + verified quality tier + profile/company evidence / all reference identities",
         "reference_warning": gold.get("warning", ""),
         "reference_identities": total,
+        "name_matches": name_hits,
+        "name_recall": round(name_hits / total, 4) if total else 0.0,
         "identity_matches": identity_hits,
         "identity_recall": round(identity_hits / total, 4) if total else 0.0,
         "verified_evidence_complete_matches": verified_hits,

@@ -17,9 +17,9 @@ args = parser.parse_args([
     "out",
 ])
 
-assert args.platforms == "google-scholar,semantic-scholar,openalex,opencitations"
+assert args.platforms == "semantic-scholar,openalex,opencitations"
 assert args.minimum_source_success == 2
-assert args.find_workers == 4
+assert args.find_workers == 3
 assert args.metadata_workers == 12
 assert args.metadata_rps == 5.0
 assert args.async_http is True
@@ -41,5 +41,14 @@ assert args.author_quality_scope == "high-impact"
 assert args.download_scope == "high-value"
 assert args.formal_report is True
 assert args.strict_report is False
+assert args.skip_google_scholar_authors is True
+
+opt_in = parser.parse_args([
+    "run", "--paper", "Example Paper", "--output", "out",
+    "--platforms", "google-scholar,semantic-scholar,openalex,opencitations",
+    "--google-scholar-authors",
+])
+assert opt_in.platforms.startswith("google-scholar,")
+assert opt_in.skip_google_scholar_authors is False
 
 print("OK high-coverage defaults")

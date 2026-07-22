@@ -3066,6 +3066,9 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
     output = ensure_dir(args.output)
     api_key = args.s2_api_key or os.environ.get(args.s2_api_key_env or "SEMANTIC_SCHOLAR_API_KEY", "")
     platforms = [p.strip() for p in args.platforms.split(",") if p.strip()]
+    require_google_scholar = bool(getattr(args, "require_google_scholar", False))
+    if require_google_scholar and "google-scholar" not in platforms:
+        platforms.insert(0, "google-scholar")
     target: Dict[str, Any] = {"title": args.paper}
     records: List[Dict[str, Any]] = []
     platform_errors: List[Dict[str, str]] = []
@@ -3081,7 +3084,6 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
     scholar_captcha_action = getattr(args, "scholar_captcha_action", "fail") or "fail"
     scholar_captcha_timeout = numeric_arg(args, "scholar_captcha_timeout", 600.0, float)
     scholar_target_url = str(getattr(args, "scholar_target_url", "") or "").strip()
-    require_google_scholar = bool(getattr(args, "require_google_scholar", False))
 
     def handle_result(platform: str, platform_target: Dict[str, Any], platform_records: List[Dict[str, Any]], diagnostics: Dict[str, Any]) -> None:
         nonlocal target
@@ -7057,7 +7059,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 def add_common_find_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--paper", required=True, help="Target paper title or DOI")
     parser.add_argument("--output", required=True, help="Output directory")
-    parser.add_argument("--platforms", default="google-scholar,semantic-scholar,openalex,opencitations")
+    parser.add_argument("--platforms", default="semantic-scholar,openalex,opencitations", help="Comma-separated citation sources (default excludes Google Scholar; add google-scholar explicitly to enable it)")
     parser.add_argument("--max-papers", type=int, default=1000, help="Maximum citing papers per platform (default: 1000)")
     parser.add_argument("--browser", choices=["chrome", "edge", "firefox"], default="edge")
     parser.add_argument("--scholar-locale", default="zh-CN", help="Google Scholar UI locale for search/cited-by pages (default: zh-CN)")
@@ -7066,14 +7068,14 @@ def add_common_find_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-delay", type=float, default=3.0)
     parser.add_argument("--s2-api-key", default="")
     parser.add_argument("--s2-api-key-env", default="SEMANTIC_SCHOLAR_API_KEY")
-    parser.add_argument("--find-workers", type=int, default=4, help="Parallel source workers for discovery fan-out (default: 4; Google Scholar itself remains serial)")
+    parser.add_argument("--find-workers", type=int, default=3, help="Parallel source workers for discovery fan-out (default: 3; Google Scholar is opt-in and remains serial internally)")
     parser.add_argument("--metadata-workers", type=int, default=12, help="Concurrent Crossref metadata workers after OpenCitations discovery (default: 12)")
     parser.add_argument("--metadata-rps", type=float, default=5.0, help="Maximum async Crossref request starts per second (default: 5)")
     parser.add_argument("--async-http", action=argparse.BooleanOptionalAction, default=True, help="Use aiohttp connection pooling for Crossref metadata fan-out (default: enabled)")
     parser.add_argument("--source-failure-policy", choices=["skip", "retry"], default="skip", help="On discovery 429/5xx/timeout, skip the source immediately or retry it (default: skip)")
     parser.add_argument("--source-cache", action=argparse.BooleanOptionalAction, default=True, help="Reuse a recent successful source snapshot when that source is temporarily unavailable (default: enabled)")
     parser.add_argument("--source-cache-max-age-hours", type=float, default=168.0, help="Maximum age of a discovery source cache snapshot (default: 168 hours)")
-    parser.add_argument("--require-google-scholar", action="store_true", help="Fail the find/run if Google Scholar produces no citing rows")
+    parser.add_argument("--require-google-scholar", action="store_true", help="Enable Google Scholar and fail the find/run if it produces no citing rows")
     parser.add_argument("--minimum-source-success", type=int, default=2, help="Minimum citation platforms that must return records (default: 2)")
     parser.add_argument("--scholar-captcha-action", choices=["wait", "fail"], default="fail", help="How to handle Google Scholar captcha pages during discovery (default: fail and let other sources continue)")
     parser.add_argument("--scholar-captcha-timeout", type=float, default=600.0, help="Seconds to wait for manual Google Scholar captcha completion when action is wait (default: 600)")
@@ -7088,7 +7090,10 @@ def add_common_author_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--scholar-locale", default="en", help="Google Scholar UI locale for author profile search (default: en)")
     parser.add_argument("--scholar-captcha-action", choices=["wait", "fail"], default="wait", help="How to handle Google Scholar author captcha pages (default: wait)")
     parser.add_argument("--scholar-captcha-timeout", type=float, default=600.0, help="Seconds to wait for manual Google Scholar author captcha completion (default: 600)")
-    parser.add_argument("--skip-google-scholar-authors", action="store_true", help="Skip Google Scholar author profile queries; useful for unattended dashboard/report refreshes")
+    scholar_author_group = parser.add_mutually_exclusive_group()
+    scholar_author_group.add_argument("--google-scholar-authors", dest="skip_google_scholar_authors", action="store_false", help="Opt in to serial Google Scholar author-profile queries")
+    scholar_author_group.add_argument("--skip-google-scholar-authors", dest="skip_google_scholar_authors", action="store_true", help="Skip Google Scholar author-profile queries (default)")
+    parser.set_defaults(skip_google_scholar_authors=True)
     parser.add_argument("--min-delay", type=float, default=1.0)
     parser.add_argument("--max-delay", type=float, default=3.0)
     parser.add_argument("--s2-api-key", default="")
@@ -7164,7 +7169,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--wiki-workers", type=int, default=4, help="Parallel Wikipedia/Wikidata/homepage workers (default: 4)")
     run_p.add_argument("--homepage-search-limit", type=int, default=250, help="Maximum expert-scope authors to search for personal/school homepages when profiles do not provide one (default: 250)")
     run_p.add_argument("--author-quality-scope", choices=["high-value", "elite", "high-impact", "all-notable"], default="high-impact", help="Core citation rows: elite awards, academy/IEEE Fellows, major-company authors, and verified high-impact scholars by default")
-    run_p.add_argument("--skip-google-scholar-authors", action="store_true", help="Skip Google Scholar author profile queries during run")
+    run_scholar_author_group = run_p.add_mutually_exclusive_group()
+    run_scholar_author_group.add_argument("--google-scholar-authors", dest="skip_google_scholar_authors", action="store_false", help="Opt in to serial Google Scholar author-profile queries")
+    run_scholar_author_group.add_argument("--skip-google-scholar-authors", dest="skip_google_scholar_authors", action="store_true", help="Skip Google Scholar author-profile queries (default)")
+    run_p.set_defaults(skip_google_scholar_authors=True)
     # --export-legacy-csv is added by add_common_find_args.
     run_p.set_defaults(func=cmd_run)
     return parser

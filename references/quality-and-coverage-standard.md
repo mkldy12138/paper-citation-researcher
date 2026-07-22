@@ -8,7 +8,7 @@ The reference GPUSQ report contains 72 reported citations, 15 detailed author re
 
 ## Discovery
 
-1. Query Google Scholar, Semantic Scholar, and OpenAlex by default. Add OpenCitations for DOI cross-checking when available.
+1. Query Semantic Scholar, OpenAlex, and OpenCitations/Crossref by default. Add Google Scholar only when the user explicitly accepts browser verification or requires its reported count.
 2. Require at least two successful citation sources. Record source-specific reported counts, collected rows, failures, and retrieval dates.
 3. Continue pagination to the platform limit. Deduplicate by normalized title/year plus DOI and stable IDs.
 4. Expand every collected citing paper to every author. Do not limit candidate discovery to first authors or the highest-cited papers.

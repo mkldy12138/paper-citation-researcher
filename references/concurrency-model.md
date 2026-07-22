@@ -4,7 +4,7 @@ Use this model for all full and high-coverage runs. The pipeline follows Map-Bar
 
 ## Stages
 
-1. **Citation discovery**: run Google Scholar, Semantic Scholar, OpenAlex, and OpenCitations concurrently with `--find-workers 4`. Keep Google Scholar pagination serial inside its single browser worker.
+1. **Citation discovery**: run Semantic Scholar, OpenAlex, and OpenCitations concurrently with `--find-workers 3`. Google Scholar is opt-in; when enabled, keep its pagination serial inside one browser worker.
 2. **Metadata expansion**: after OpenCitations returns DOI links, fetch Crossref metadata with `--metadata-workers 12` and pace request starts with `--metadata-rps 5`. Preserve the original DOI order after the barrier.
 3. **Discovery reduction**: wait for all source workers, then merge and deduplicate. Never write a partial workbook while another source is still running.
    After the barrier, persist one independent snapshot per successful source. A 429/5xx/timeout may use a recent same-target snapshot labeled `cached_fallback`; do not retry a temporarily unavailable source in `skip` mode.

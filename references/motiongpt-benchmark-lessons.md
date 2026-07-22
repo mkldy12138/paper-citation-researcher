@@ -34,3 +34,5 @@ Benchmark file: `MotionGPT_ Human Mot_2026年07月14日17时48分00秒.pdf`.
 ## Quality target
 
 Match the benchmark's evidence density, not its unsupported certainty. A comparable result should have one author per row, exact citing-paper title, verified titles/honors, direct company-affiliation evidence, profile/homepage, confidence label, and citation context where available. In strict mode, fewer than two enrichment passes, a nonzero final-pass yield, fewer than 50% of retained people with verified body context, or missing per-context role/original text/Chinese explanation fails the quality gate.
+
+Report benchmark recall at three levels: normalized-name presence, affiliation-resolved identity, and full VHAR evidence. Never count a unique same-name row as identity-resolved when the reference provides an affiliation and the collected profile has no matching affiliation evidence.
