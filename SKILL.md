@@ -23,6 +23,8 @@ Use this skill only for focused high-value citation research. Do not make a broa
 9. Do not download and analyze every citing PDF by default. Download only retained high-value citing papers when body-context evidence is requested or needed to resolve ambiguity.
 10. When a formal Chinese PDF is requested, convert the verified retained records to `references/report-data-schema.md`, validate the JSON, render the PDF, then inspect rendered pages before delivery.
 11. For AMiner-scale or exhaustive requests, read `references/quality-and-coverage-standard.md`, expand every citing author, complete at least two enrichment passes, and run the strict quality audit before rendering.
+12. For full runs, read `references/concurrency-model.md`. Use bounded Map-Barrier-Reduce concurrency: fan out independent sources/tasks, wait for the entire stage, merge deterministically, then start the dependent stage.
+13. When the user expects AMiner/MotionGPT-scale author coverage, read `references/motiongpt-benchmark-lessons.md`. Preserve structured citing-author institutions, run honor/company-targeted deep searches, and deliver a strict high-value layer plus a separately labeled high-impact supplement.
 
 ## High-Value Reporting Rules
 
@@ -43,7 +45,7 @@ Use this skill only for focused high-value citation research. Do not make a broa
 Run the full workflow:
 
 ```powershell
-python scripts/paper_citation_researcher.py run --paper "Attention Is All You Need" --output ".\citation-output" --max-papers 1000 --browser edge --scholar-locale zh-CN --download-workers 4
+python scripts/paper_citation_researcher.py run --paper "Attention Is All You Need" --output ".\citation-output" --max-papers 1000 --browser edge --scholar-locale zh-CN --find-workers 4 --metadata-workers 12 --author-workers 8 --wiki-workers 4 --download-workers 8 --analyze-workers 4
 ```
 
 Generate the formal Chinese PDF after creating the verified report JSON:
@@ -93,17 +95,27 @@ Optional configuration:
 - `--s2-api-key` / `--s2-api-key-env`: use these only when overriding the default API-key source.
 - `--scholar-locale`: defaults to `zh-CN` for paper search and `en` for author profile search.
 - `--max-papers`: defaults to `1000`; confirm this value at the start of each new target-paper topic.
-- `--find-workers`: defaults to `2`; runs independent source platforms in parallel. Google Scholar itself remains one browser session with serial pagination.
+- `--find-workers`: defaults to `4`; starts all four citation sources concurrently. Google Scholar itself remains one browser session with serial pagination.
+- `--metadata-workers`: defaults to `12`; concurrently enriches OpenCitations DOI records through Crossref after citation-link discovery.
+- `--metadata-rps`: defaults to `5`; rate-limits async Crossref request starts so concurrency does not reduce metadata coverage.
+- `--async-http` / `--no-async-http`: defaults to enabled; reuse one `aiohttp` connection pool for Crossref metadata.
+- `--source-failure-policy skip|retry`: defaults to `skip`; immediately isolate a discovery source on 429, temporary 5xx, timeout, captcha, or exhausted quota.
+- `--source-cache` / `--no-source-cache`: defaults to enabled. On a temporary live-source failure, reuse only a recent successful snapshot for the same normalized target and label it `cached_fallback`; never represent cached evidence as a fresh response.
+- `--source-cache-max-age-hours`: defaults to `168`. Older snapshots are ignored.
+- `--scholar-target-url`: optional exact Google Scholar citation-detail URL or `/scholar?cites=...` URL. Prefer it when the user supplies one; the detail-page title is still identity-checked before collection.
 - `--minimum-source-success`: defaults to `2`; fail high-coverage discovery when fewer than two platforms return records.
 - `--require-google-scholar`: fail `find`/`run` if Google Scholar produces no citing rows, while still writing failure diagnostics to `citation_report.xlsx`.
-- `--scholar-captcha-action wait|fail`: defaults to `wait`; when Google Scholar shows captcha, keep the visible browser open and wait for manual verification.
+- `--scholar-captcha-action wait|fail`: defaults to `fail` during discovery so other sources continue; explicitly choose `wait` when manual Google Scholar completion is required.
 - `--scholar-captcha-timeout`: defaults to `600` seconds; maximum wait time for manual Google Scholar verification.
-- `--author-workers`: defaults to `4`; controls parallel Semantic Scholar Author API profile queries.
-- `--wiki-workers`: defaults to `2`; controls parallel Wikipedia/Wikidata enrichment for top non-target authors.
+- `--author-workers`: defaults to `8`; controls parallel Semantic Scholar Author API profile queries.
+- `--author-failure-policy skip|retry`: defaults to `skip`; probe Semantic Scholar once and open a circuit on 429/5xx/timeout before queuing hundreds of author requests. Skipped entries remain retryable on the next run.
+- `--wiki-workers`: defaults to `4`; controls parallel Wikipedia/Wikidata and homepage enrichment.
+- `--download-workers`: defaults to `8`; downloads distinct citing PDFs concurrently.
+- `--analyze-workers`: defaults to `4`; analyzes distinct local PDFs concurrently before ordered reduction.
 - `--author-top-n`: defaults to `100`; controls priority roster and biographical enrichment.
 - `--max-author-profiles`: defaults to `1000`; covers the complete citing-author pool for detailed investigations.
 - `--homepage-search-limit`: defaults to `250`; for expert-scope authors without a known profile homepage, searches for likely personal/school homepages and extracts profile evidence.
-- `--author-quality-scope`: defaults to `high-value`, so the core output includes verified elite-award recipients, academy members/Royal Society Fellows, and IEEE Fellows. Use `elite` to exclude IEEE Fellows, `high-impact` to add identity-verified metric-threshold authors, or `all-notable` only for debugging.
+- `--author-quality-scope`: defaults to `high-impact`, so the selected output includes verified elite-award recipients, academy members/Royal Society Fellows, IEEE Fellows, directly evidenced major-company authors, and identity-verified metric-threshold scholars. Use `high-value` to omit metric-only scholars, `elite` for awards/academies only, or `all-notable` only for debugging.
 - `--skip-google-scholar-authors`: optional refresh/debug flag. It preserves already cached Google Scholar author profiles and only marks uncached profiles as skipped.
 - `--export-legacy-csv`: debugging option that also writes old CSV/XLSX tables. Do not use it for normal runs.
 
@@ -127,19 +139,21 @@ Required values:
 
 When the user asks what can be changed, explain only the relevant phase:
 
-- `find`: `--platforms`, `--max-papers`, `--find-workers`, `--browser`, `--scholar-locale`, `--scholar-captcha-action`, `--scholar-captcha-timeout`, `--require-google-scholar`, `--min-delay`, `--max-delay`, `--s2-api-key-env`, `--export-legacy-csv`.
-- `authors`: `--author-top-n`, `--max-author-profiles`, `--browser`, `--scholar-locale`, `--scholar-captcha-action`, `--scholar-captcha-timeout`, `--skip-google-scholar-authors`, `--author-workers`, `--wiki-workers`, `--homepage-search-limit`, `--min-delay`, `--max-delay`, `--s2-api-key-env`, `--export-legacy-csv`.
+- `find`: `--platforms`, `--max-papers`, `--find-workers`, `--metadata-workers`, `--metadata-rps`, `--async-http`, `--source-failure-policy`, `--source-cache`, `--source-cache-max-age-hours`, `--scholar-target-url`, `--browser`, `--scholar-locale`, `--scholar-captcha-action`, `--scholar-captcha-timeout`, `--require-google-scholar`, `--min-delay`, `--max-delay`, `--s2-api-key-env`, `--export-legacy-csv`.
+- `authors`: `--author-top-n`, `--max-author-profiles`, `--browser`, `--scholar-locale`, `--scholar-captcha-action`, `--scholar-captcha-timeout`, `--skip-google-scholar-authors`, `--author-workers`, `--author-failure-policy`, `--wiki-workers`, `--homepage-search-limit`, `--min-delay`, `--max-delay`, `--s2-api-key-env`, `--export-legacy-csv`.
 - `download`: `--download-workers`, `--arxiv-fallback` / `--no-arxiv-fallback`, `--export-legacy-csv`.
-- `analyze`: `--context-lines`, `--analysis-scope`, `--pdf-dir`, `--metadata`, `--export-legacy-csv`.
+- `analyze`: `--context-lines`, `--analysis-scope`, `--analyze-workers`, `--pdf-dir`, `--metadata`, `--export-legacy-csv`.
 
 ## Behavior
 
-- Google Scholar uses Selenium. Captcha handling is explicit: by default `--scholar-captcha-action wait` keeps the visible browser open, shows a Windows popup when verification is detected, saves `scholar_debug/` URL/HTML/screenshot evidence, records status in `run_notes`, and waits up to `--scholar-captcha-timeout` seconds for manual verification. Use `--scholar-captcha-action fail` only for non-interactive diagnostic runs.
+- Google Scholar uses Selenium. Discovery defaults to `--scholar-captcha-action fail`, saves `scholar_debug/` evidence, records status, and lets other sources complete. Use `wait` explicitly when a visible browser should remain open for manual verification.
 - Google Scholar, Semantic Scholar, OpenAlex, and OpenCitations/Crossref are enabled by default. Confirm actual use through dashboard source status, `run_notes`, and `papers.source_platforms`; require at least two sources to return records.
 - Use `--require-google-scholar` when the report must include Google Scholar discovery. If Google Scholar is blocked or yields zero citing rows, the command fails after writing diagnostics and must not be treated as a complete Google Scholar investigation.
-- `find` runs independent sources in parallel. Do not open multiple Google Scholar browser sessions for the same run; Google Scholar pagination stays serial so target matching, cited-by pagination, and captcha handling remain reliable.
+- `find` runs all independent sources concurrently and waits at a barrier before merge/deduplication. Do not open multiple Google Scholar browser sessions for the same run; Google Scholar pagination stays serial so target matching, cited-by pagination, and captcha handling remain reliable.
+- With the default `--source-failure-policy skip`, a source that returns 429/5xx, times out, exhausts quota, or triggers a captcha is recorded in `platform_errors` and skipped without blocking successful sources. Use `retry` only when completeness outweighs latency.
+- When source caching is enabled, a skipped live source may contribute its most recent successful same-target snapshot. Record both the live error and `cached_fallback` status. Save successful source results independently after the discovery barrier so an intermittent source cannot erase a previously complete run.
 - Google Scholar defaults to `--scholar-locale zh-CN` because cited-by pagination can expose different pages by locale; use `--scholar-locale en` only when needed.
-- Google Scholar target pages can report a larger cited-by count than the Next links expose. Read the reported cited-by count from the target page, then keep trying cited-by pages with `start += 10` until the reported count, `--max-papers`, or consecutive empty pages stop the run. Log when Google reports more citations than it exposes through result pages.
+- Google Scholar target pages can report a larger cited-by count than the public result pages expose. Read and preserve the reported count, but keep the collected-row count separate. Stop immediately at the known public pagination boundary when `start>=100` returns no rows; label the result `partial_google_result_cap` instead of wasting retries or pretending the hidden rows were collected.
 - If Google Scholar target matching succeeds and some cited-by pages are already collected, a later pagination/captcha/driver interruption preserves the partial Google Scholar rows, records `partial_error` or `partial_captcha_blocked`, and continues downstream instead of discarding collected rows.
 - Citing-paper rows from every source must include `citation_count`: parse the source count when present, otherwise write `0` instead of leaving the field empty.
 - Semantic Scholar uses the Graph API and supports an optional API key. Leave `--s2-api-key` empty for anonymous requests, or use `--s2-api-key-env SEMANTIC_SCHOLAR_API_KEY` to enable authenticated requests later without changing workflows.
@@ -148,7 +162,7 @@ When the user asks what can be changed, explain only the relevant phase:
 - For Semantic Scholar 429/5xx responses, read `Retry-After`, use backoff, and include status, URL, and a short response-body excerpt in `platform_errors.semantic-scholar`.
 - `dedupe_key` in outputs always uses normalized title plus year. DOI, Semantic Scholar IDs, landing URLs, PDF URLs, OA PDF URLs, arXiv, and ACL links are internal duplicate-detection aliases.
 - When multiple sources return the same citing paper, Google Scholar display fields take priority while Semantic Scholar and OpenAlex IDs, DOI, author IDs, institutions, and open-access metadata are retained.
-- The `papers` sheet always includes both the display author string and structured author fields (`citing_authors_json`, `citing_author_ids`) when available. Google-only rows may have only parsed names.
+- The `papers` sheet always includes both the display author string and structured author fields (`citing_authors_json`, `citing_author_ids`) when available. Structured authors preserve source-specific Semantic Scholar/OpenAlex IDs and OpenAlex institutions across source merges. Google-only rows may have only parsed names.
 - The `authors` stage deduplicates authors by Semantic Scholar `authorId` first, then normalized name. It queries at most `--max-author-profiles` authors by default, prioritizing candidates with Semantic Scholar IDs, highly cited source papers, and repeated appearances. Semantic Scholar Author API lookups use `--author-workers` parallel workers.
 - Author ranking, high-quality-author detection, dashboard author charts, and each paper's `top_author_*` fields exclude all target-paper authors, using `authorId` first and normalized names as a fallback. Per-paper representative authors prefer quality tier before personal citation count.
 - Each row in the `papers` sheet records the highest-cited non-target author when one is available. If all authors are target authors, `top_author_status` is `all_authors_excluded_target`.
@@ -156,6 +170,8 @@ When the user asks what can be changed, explain only the relevant phase:
 - Google Scholar author profile lookups remain serial by default because they have no stable public API, rely on profile work-list evidence to avoid homonym errors, and are sensitive to captcha/rate limiting. The `authors` stage opens a visible Google Scholar author-search browser session by default; if a verification page appears, complete it in that browser window and the script transfers the verified cookies back to the author-profile requests. When a high-confidence profile is found, capture its personal citation count, affiliation, research interests, verified-email text, and Homepage link. Chinese and English Google Scholar citation labels are both parsed. If `--skip-google-scholar-authors` is used during a refresh, existing cached Scholar author profiles remain available in the workbook and dashboard.
 - For unattended report/dashboard refreshes, pass `--skip-google-scholar-authors` to avoid Google Scholar author profile pages and captcha prompts. This keeps Semantic Scholar author metrics, Wikipedia/Wikidata, homepage evidence, notable-scholar tables, and dashboard generation working while marking author Google Scholar profile querying as skipped.
 - Author title/honor enrichment also follows the Google Scholar or Semantic Scholar homepage URL when present, including university/lab/personal pages. If no homepage URL is available, the expert-scope fallback uses a deep-search-style web search for likely personal/school profile pages (`--homepage-search-limit`, default 50), then validates that the page is the same person by cross-checking name, known affiliation, research interests, source context, and education/background evidence before accepting it. Deep-search pages must not be accepted on name alone: they need affiliation/research overlap, or an exact name plus education/background evidence on an academic profile URL. Unverified or same-name-only pages are rejected with `personal_homepage_rejection_reason` and are not shown as author homepage links. Verified evidence is shown in the dashboard as `personal_or_school_homepage`.
+- Deep search uses exact-name queries targeted at the citing-paper affiliation, IEEE/ACM/AAAI Fellow status, national academies/Royal Society/Academia Europaea, and university/personal profiles. Authoritative society or academy pages receive a ranking boost, but identity still requires cross-evidence.
+- OpenAlex institution evidence is retained per author and per citing paper. Major-company classification requires that structured authorship and company institution share the same citing record; supported companies include Google/DeepMind, NVIDIA, Microsoft, Meta, Amazon, Apple, Adobe, Intel, IBM, ByteDance/TikTok, Tencent, Alibaba, Huawei, Samsung, OpenAI, Waymo, Baidu, Kuaishou, and Megvii.
 - Wikipedia/Wikidata enrichment checks priority non-target authors and uses roster reverse-matching when a complete author list is available. Classify verified authors as `elite_award`, `academy_member`, `ieee_fellow`, `high_impact`, `other_notable`, or `unverified`. The default core table accepts `elite_award`, `academy_member`, and `ieee_fellow`; ordinary professors, editors, conference chairs, and general society members do not qualify. Preserve evidence and rejection reasons for auditability.
 - PDF downloading uses parallel workers by default (`--download-workers 4`).
 - PDF download only uses open/direct links, publisher metadata links, arXiv, or ACL Anthology. Do not use paywall bypasses.

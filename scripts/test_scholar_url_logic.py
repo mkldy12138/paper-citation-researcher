@@ -93,6 +93,38 @@ def run_checks(module) -> None:
         "https://scholar.google.com/scholar?hl=en&start=10&cites=123"
     )
 
+    explicit_html = """
+    <html><body>
+      <div id="gsc_oci_title">Michelangelo: Conditional 3D Shape Generation Based on Shape-Image-Text Aligned Latent Representation</div>
+      <a href="/scholar?oi=bibs&amp;hl=en&amp;cites=17145666492025351222&amp;as_sdt=5">Cited by 256</a>
+    </body></html>
+    """
+
+    class FakeDriver:
+        page_source = explicit_html
+        current_url = ""
+        title = "View article"
+
+        def get(self, url: str) -> None:
+            self.current_url = url
+
+    diagnostics = {"events": []}
+    cited_url, found, total = module.explicit_google_scholar_target(
+        FakeDriver(),
+        "Michelangelo: Conditional 3D Shape Generation Based on Shape-Image-Text Aligned Latent Representation",
+        "https://scholar.google.com/citations?view_op=view_citation&user=test&citation_for_view=test:item",
+        0,
+        0,
+        "fail",
+        Path("scholar_debug"),
+        diagnostics,
+        1,
+    )
+    assert found is True
+    assert total == 256
+    assert module.scholar_query_value(cited_url, "cites") == "17145666492025351222"
+    assert diagnostics["target_score"] == "1.000"
+
 
 def main() -> None:
     paths = module_paths()

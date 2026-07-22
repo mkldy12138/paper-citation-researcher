@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import random
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -17,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
+import aiohttp
 import requests
 from bs4 import BeautifulSoup
 
@@ -77,7 +80,16 @@ CITING_COLUMNS = [
 S2_FIELDS = "title,externalIds,year,venue,authors,paperId,url,citationCount,openAccessPdf"
 S2_MAX_RETRY_DELAY = 60
 GOOGLE_AUTHOR_TIMEOUT = 10
-PROFILE_ENRICHMENT_VERSION = "2026-06-10-profile-v7-identity-background"
+PROFILE_ENRICHMENT_VERSION = "2026-07-22-profile-v8-deep-honor-company"
+_HTTP_THREAD_LOCAL = threading.local()
+
+
+def thread_http_session() -> requests.Session:
+    session = getattr(_HTTP_THREAD_LOCAL, "session", None)
+    if session is None:
+        session = make_session()
+        _HTTP_THREAD_LOCAL.session = session
+    return session
 GOOGLE_AUTHOR_ENRICHMENT_VERSION = "2026-06-10-google-author-v6-cited-by-locale"
 EXCEL_ILLEGAL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]")
 REF_LABEL_RE = re.compile(r"^\s*(?:\[\s*(\d{1,4})\s*\]|(\d{1,4})[\.\)]\s+)")
@@ -146,6 +158,10 @@ AUTHOR_COLUMNS = [
     "name",
     "normalized_name",
     "semantic_author_id",
+    "openalex_author_id",
+    "source_affiliations",
+    "source_company_affiliations",
+    "company_affiliation_evidence",
     "is_target_author",
     "target_author_match",
     "citing_paper_count",
@@ -288,6 +304,10 @@ PAPER_AUTHOR_COLUMNS = [
     "name",
     "normalized_name",
     "semantic_author_id",
+    "openalex_author_id",
+    "source_affiliations",
+    "source_company_affiliations",
+    "company_affiliation_evidence",
     "is_target_author",
     "target_author_match",
     "selected_citation_count",
@@ -824,11 +844,16 @@ def s2_match_candidates(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
-def s2_resolve_paper(session: requests.Session, identifier: str, api_key: str = "") -> Dict[str, Any]:
+def s2_resolve_paper(
+    session: requests.Session,
+    identifier: str,
+    api_key: str = "",
+    max_retries: int = 4,
+) -> Dict[str, Any]:
     if is_doi(identifier):
         doi_key = urllib.parse.quote(f"DOI:{clean_doi(identifier)}", safe="")
         url = f"https://api.semanticscholar.org/graph/v1/paper/{doi_key}"
-        response = s2_get(session, url, {"fields": S2_FIELDS}, api_key)
+        response = s2_get(session, url, {"fields": S2_FIELDS}, api_key, max_retries=max_retries)
         if response.ok:
             return response.json()
         s2_raise_for_status(response, "DOI resolve")
@@ -839,6 +864,7 @@ def s2_resolve_paper(session: requests.Session, identifier: str, api_key: str = 
         "https://api.semanticscholar.org/graph/v1/paper/search/match",
         {"query": identifier, "fields": S2_FIELDS},
         api_key,
+        max_retries=max_retries,
     )
     if response.ok:
         matches = s2_match_candidates(response.json())
@@ -857,6 +883,7 @@ def s2_resolve_paper(session: requests.Session, identifier: str, api_key: str = 
             "https://api.semanticscholar.org/graph/v1/paper/search",
             {"query": query, "limit": 10, "fields": S2_FIELDS},
             api_key,
+            max_retries=max_retries,
         )
         s2_raise_for_status(response, "title search")
         search_candidates = response.json().get("data", [])
@@ -880,6 +907,7 @@ def s2_fetch_citations(
     target: Dict[str, Any],
     limit: int,
     api_key: str = "",
+    max_retries: int = 4,
 ) -> List[Dict[str, Any]]:
     paper_id = target.get("paperId")
     if not paper_id:
@@ -901,6 +929,7 @@ def s2_fetch_citations(
             {"limit": page_size, "offset": offset, "fields": fields},
             api_key,
             timeout=45,
+            max_retries=max_retries,
         )
         s2_raise_for_status(response, "citation fetch")
         payload = response.json()
@@ -917,7 +946,14 @@ def s2_fetch_citations(
                 seen.add(paper_id_value)
             external = paper.get("externalIds") or {}
             author_details = [
-                {"name": a.get("name", ""), "authorId": a.get("authorId", "")}
+                {
+                    "name": a.get("name", ""),
+                    "authorId": a.get("authorId", ""),
+                    "authorIdType": "semantic-scholar",
+                    "semanticAuthorId": a.get("authorId", ""),
+                    "openalexAuthorId": "",
+                    "institutions": [],
+                }
                 for a in paper.get("authors", [])
                 if a.get("name")
             ]
@@ -955,7 +991,12 @@ def s2_fetch_citations(
     return rows
 
 
-def openalex_get(session: requests.Session, url: str, params: Dict[str, Any] | None = None) -> requests.Response:
+def openalex_get(
+    session: requests.Session,
+    url: str,
+    params: Dict[str, Any] | None = None,
+    failure_policy: str = "retry",
+) -> requests.Response:
     query = dict(params or {})
     mailto = os.environ.get("OPENALEX_MAILTO", "").strip()
     if mailto:
@@ -964,7 +1005,8 @@ def openalex_get(session: requests.Session, url: str, params: Dict[str, Any] | N
     if api_key:
         query.setdefault("api_key", api_key)
     response = None
-    for attempt in range(6):
+    attempts = 1 if failure_policy == "skip" else 6
+    for attempt in range(attempts):
         response = session.get(
             url,
             params=query,
@@ -984,24 +1026,29 @@ def openalex_get(session: requests.Session, url: str, params: Dict[str, Any] | N
             delay = min(max(float(retry_after), 1.0), 20.0)
         except ValueError:
             delay = min(2 ** attempt, 20)
-        if attempt < 5:
+        if attempt < attempts - 1:
             time.sleep(delay)
     assert response is not None
     response.raise_for_status()
     return response
 
 
-def openalex_resolve_paper(session: requests.Session, identifier: str) -> Dict[str, Any]:
+def openalex_resolve_paper(
+    session: requests.Session,
+    identifier: str,
+    failure_policy: str = "retry",
+) -> Dict[str, Any]:
     if is_doi(identifier):
         doi = clean_doi(identifier)
         encoded = urllib.parse.quote(f"https://doi.org/{doi}", safe="")
-        response = openalex_get(session, f"https://api.openalex.org/works/{encoded}")
+        response = openalex_get(session, f"https://api.openalex.org/works/{encoded}", failure_policy=failure_policy)
         return response.json()
 
     response = openalex_get(
         session,
         "https://api.openalex.org/works",
         {"search": identifier, "per-page": 10},
+        failure_policy=failure_policy,
     )
     candidates = response.json().get("results", [])
     if not candidates:
@@ -1018,6 +1065,26 @@ def openalex_resolve_paper(session: requests.Session, identifier: str) -> Dict[s
     if score < 0.45:
         titles = "; ".join(work.get("title", "") for work in candidates[:5])
         raise RuntimeError(f"OpenAlex could not confidently resolve target paper: {identifier}; candidates: {titles}")
+    # OpenAlex can split the same paper across proceedings and preprint records.
+    # Preserve only near-exact title matches so discovery can union their citing
+    # works without broadening the target to merely related papers.
+    matched_versions = [
+        work
+        for work in candidates
+        if score_work(work) >= max(0.92, score - 0.02)
+        and normalize_text(work.get("title", "")) == normalize_text(best.get("title", ""))
+    ]
+    best = dict(best)
+    best["_matched_versions"] = [
+        {
+            "id": work.get("id", ""),
+            "doi": work.get("doi", ""),
+            "title": work.get("title", ""),
+            "cited_by_count": work.get("cited_by_count", 0),
+        }
+        for work in matched_versions
+        if work.get("id")
+    ]
     return best
 
 
@@ -1025,85 +1092,101 @@ def openalex_fetch_citations(
     session: requests.Session,
     target: Dict[str, Any],
     limit: int,
+    failure_policy: str = "retry",
 ) -> List[Dict[str, Any]]:
-    target_id = str(target.get("id", "")).rsplit("/", 1)[-1]
-    if not target_id:
+    versions = target.get("_matched_versions") or [{"id": target.get("id", "")}]
+    target_ids = list(
+        dict.fromkeys(
+            str(version.get("id", "")).rsplit("/", 1)[-1]
+            for version in versions
+            if version.get("id")
+        )
+    )
+    if not target_ids:
         return []
     rows: List[Dict[str, Any]] = []
-    cursor = "*"
-    while len(rows) < limit and cursor:
-        page_size = min(200, limit - len(rows))
-        response = openalex_get(
-            session,
-            "https://api.openalex.org/works",
-            {
-                "filter": f"cites:{target_id}",
-                "per-page": page_size,
-                "cursor": cursor,
-            },
-        )
-        payload = response.json()
-        works = payload.get("results", [])
-        if not works:
-            break
-        for work in works:
-            author_details = []
-            for authorship in work.get("authorships", []):
-                author = authorship.get("author") or {}
-                institutions = authorship.get("institutions") or []
-                author_details.append(
+    for target_id in target_ids:
+        version_rows: List[Dict[str, Any]] = []
+        cursor = "*"
+        while len(version_rows) < limit and cursor:
+            page_size = min(200, limit - len(version_rows))
+            response = openalex_get(
+                session,
+                "https://api.openalex.org/works",
+                {
+                    "filter": f"cites:{target_id}",
+                    "per-page": page_size,
+                    "cursor": cursor,
+                    "select": "id,title,authorships,publication_year,primary_location,open_access,best_oa_location,ids,cited_by_count",
+                },
+                failure_policy=failure_policy,
+            )
+            payload = response.json()
+            works = payload.get("results", [])
+            if not works:
+                break
+            for work in works:
+                author_details = []
+                for authorship in work.get("authorships", []):
+                    author = authorship.get("author") or {}
+                    institutions = authorship.get("institutions") or []
+                    author_details.append(
+                        {
+                            "name": author.get("display_name", ""),
+                            "authorId": str(author.get("id", "")).rsplit("/", 1)[-1],
+                            "authorIdType": "openalex",
+                            "semanticAuthorId": "",
+                            "openalexAuthorId": str(author.get("id", "")).rsplit("/", 1)[-1],
+                            "institutions": [
+                                {
+                                    "name": inst.get("display_name", ""),
+                                    "id": inst.get("id", ""),
+                                    "ror": inst.get("ror", ""),
+                                    "country_code": inst.get("country_code", ""),
+                                    "type": inst.get("type", ""),
+                                }
+                                for inst in institutions
+                            ],
+                        }
+                    )
+                author_details = [item for item in author_details if item.get("name")]
+                primary = work.get("primary_location") or {}
+                source = primary.get("source") or {}
+                open_access = work.get("open_access") or {}
+                best_oa = work.get("best_oa_location") or {}
+                ids = work.get("ids") or {}
+                doi = str(ids.get("doi") or "").replace("https://doi.org/", "")
+                openalex_id = str(work.get("id", "")).rsplit("/", 1)[-1]
+                version_rows.append(
                     {
-                        "name": author.get("display_name", ""),
-                        "authorId": str(author.get("id", "")).rsplit("/", 1)[-1],
-                        "institutions": [
-                            {
-                                "name": inst.get("display_name", ""),
-                                "id": inst.get("id", ""),
-                                "ror": inst.get("ror", ""),
-                                "country_code": inst.get("country_code", ""),
-                                "type": inst.get("type", ""),
-                            }
-                            for inst in institutions
-                        ],
+                        "source_platforms": "openalex",
+                        "source_record_ids": f"openalex:{openalex_id}" if openalex_id else "",
+                        "citing_title": work.get("title") or "",
+                        "citing_authors": ", ".join(item["name"] for item in author_details),
+                        "citing_authors_json": json.dumps(author_details, ensure_ascii=False),
+                        "citing_author_ids": ";".join(item["authorId"] for item in author_details if item.get("authorId")),
+                        "publication_year": work.get("publication_year") or "",
+                        "venue": source.get("display_name") or "",
+                        "doi": doi,
+                        "url": primary.get("landing_page_url") or ids.get("openalex") or "",
+                        "pdf_url": primary.get("pdf_url") or "",
+                        "open_access_pdf_url": best_oa.get("pdf_url") or (primary.get("pdf_url") if open_access.get("is_oa") else "") or "",
+                        "citation_count": citation_count_or_zero(work.get("cited_by_count")),
+                        "semantic_scholar_paper_id": "",
+                        "google_scholar_cited_by_url": "",
+                        "arxiv_id": "",
+                        "acl_id": "",
+                        "abstract": "",
                     }
                 )
-            author_details = [item for item in author_details if item.get("name")]
-            primary = work.get("primary_location") or {}
-            source = primary.get("source") or {}
-            open_access = work.get("open_access") or {}
-            best_oa = work.get("best_oa_location") or {}
-            ids = work.get("ids") or {}
-            doi = str(ids.get("doi") or "").replace("https://doi.org/", "")
-            openalex_id = str(work.get("id", "")).rsplit("/", 1)[-1]
-            rows.append(
-                {
-                    "source_platforms": "openalex",
-                    "source_record_ids": f"openalex:{openalex_id}" if openalex_id else "",
-                    "citing_title": work.get("title") or "",
-                    "citing_authors": ", ".join(item["name"] for item in author_details),
-                    "citing_authors_json": json.dumps(author_details, ensure_ascii=False),
-                    "citing_author_ids": ";".join(item["authorId"] for item in author_details if item.get("authorId")),
-                    "publication_year": work.get("publication_year") or "",
-                    "venue": source.get("display_name") or "",
-                    "doi": doi,
-                    "url": primary.get("landing_page_url") or ids.get("openalex") or "",
-                    "pdf_url": primary.get("pdf_url") or "",
-                    "open_access_pdf_url": best_oa.get("pdf_url") or (primary.get("pdf_url") if open_access.get("is_oa") else "") or "",
-                    "citation_count": citation_count_or_zero(work.get("cited_by_count")),
-                    "semantic_scholar_paper_id": "",
-                    "google_scholar_cited_by_url": "",
-                    "arxiv_id": "",
-                    "acl_id": "",
-                    "abstract": "",
-                }
-            )
-            if len(rows) >= limit:
+                if len(version_rows) >= limit:
+                    break
+            cursor = (payload.get("meta") or {}).get("next_cursor")
+            if len(works) < page_size:
                 break
-        cursor = (payload.get("meta") or {}).get("next_cursor")
-        if len(works) < page_size:
-            break
-        time.sleep(0.15)
-    return rows
+            time.sleep(0.15)
+        rows.extend(version_rows)
+    return merge_records(rows)[:limit]
 
 
 def crossref_resolve_paper(session: requests.Session, identifier: str) -> Dict[str, Any]:
@@ -1148,10 +1231,92 @@ def crossref_citing_metadata(session: requests.Session, doi: str) -> Dict[str, A
     return response.json().get("message", {})
 
 
+async def async_crossref_metadata(
+    dois: Sequence[str],
+    workers: int,
+    failure_policy: str = "skip",
+    requests_per_second: float = 5.0,
+) -> Dict[int, Dict[str, Any]]:
+    workers = max(1, min(int(workers or 1), 32))
+    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+    connector = aiohttp.TCPConnector(
+        limit=workers,
+        limit_per_host=workers,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+    )
+    headers = {
+        "User-Agent": "paper-citation-researcher/1.0 (https://github.com/mkldy12138/paper-citation-researcher)",
+        "Accept": "application/json",
+    }
+    semaphore = asyncio.Semaphore(workers)
+    rate_lock = asyncio.Lock()
+    next_request_at = 0.0
+    request_interval = 1.0 / max(float(requests_per_second or 1.0), 0.1)
+    attempts = 1 if failure_policy == "skip" else 3
+
+    async with aiohttp.ClientSession(
+        headers=headers,
+        timeout=timeout,
+        connector=connector,
+        trust_env=True,
+    ) as client:
+        async def fetch_one(index: int, doi: str) -> Tuple[int, Dict[str, Any]]:
+            nonlocal next_request_at
+            if not doi:
+                return index, {}
+            url = f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}"
+            for attempt in range(attempts):
+                try:
+                    async with rate_lock:
+                        now = asyncio.get_running_loop().time()
+                        delay_before_request = max(0.0, next_request_at - now)
+                        if delay_before_request:
+                            await asyncio.sleep(delay_before_request)
+                        next_request_at = max(next_request_at, now) + request_interval
+                    async with semaphore:
+                        async with client.get(url) as response:
+                            if response.status == 200:
+                                payload = await response.json(content_type=None)
+                                return index, payload.get("message", {})
+                            text = (await response.text())[:300]
+                            if response.status == 404:
+                                return index, {"_metadata_error": "404 not found"}
+                            if response.status == 429 or response.status >= 500:
+                                if failure_policy == "skip" or attempt >= attempts - 1:
+                                    return index, {"_metadata_error": f"HTTP {response.status}: {text}"}
+                                retry_after = response.headers.get("Retry-After", "")
+                                try:
+                                    delay = min(max(float(retry_after), 0.5), 5.0)
+                                except ValueError:
+                                    delay = min(2 ** attempt, 5.0)
+                            else:
+                                return index, {"_metadata_error": f"HTTP {response.status}: {text}"}
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    if failure_policy == "skip" or attempt >= attempts - 1:
+                        return index, {"_metadata_error": str(exc)[:300]}
+                    delay = min(2 ** attempt, 5.0)
+                await asyncio.sleep(delay)
+            return index, {"_metadata_error": "metadata request exhausted retries"}
+
+        tasks = [asyncio.create_task(fetch_one(index, doi)) for index, doi in enumerate(dois)]
+        results: Dict[int, Dict[str, Any]] = {}
+        for completed, task in enumerate(asyncio.as_completed(tasks), 1):
+            index, metadata = await task
+            results[index] = metadata
+            if completed % 25 == 0 or completed == len(tasks):
+                print(f"Async Crossref metadata collected: {completed}/{len(tasks)}")
+        return results
+
+
 def opencitations_fetch_citations(
     session: requests.Session,
     target: Dict[str, Any],
     limit: int,
+    metadata_workers: int = 12,
+    use_async_http: bool = True,
+    failure_policy: str = "skip",
+    metadata_rps: float = 5.0,
 ) -> List[Dict[str, Any]]:
     target_doi = clean_doi(target.get("DOI", ""))
     if not target_doi:
@@ -1163,10 +1328,47 @@ def opencitations_fetch_citations(
     )
     response.raise_for_status()
     links = response.json()[:limit]
+    metadata_workers = max(1, min(int(metadata_workers or 1), 32))
+    metadata_by_index: Dict[int, Dict[str, Any]] = {}
+    dois = [clean_doi(link.get("citing", "")) for link in links]
+
+    def fetch_metadata(index: int, link: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        doi = clean_doi(link.get("citing", ""))
+        if not doi:
+            return index, {}
+        return index, crossref_citing_metadata(thread_http_session(), doi)
+
+    if use_async_http and links:
+        print(f"Async Crossref fan-out: {len(links)} DOI(s), connection limit {metadata_workers}")
+        metadata_by_index = asyncio.run(
+            async_crossref_metadata(dois, metadata_workers, failure_policy, metadata_rps)
+        )
+    elif metadata_workers == 1 or len(links) <= 1:
+        for index, link in enumerate(links):
+            _, metadata = fetch_metadata(index, link)
+            metadata_by_index[index] = metadata
+    else:
+        print(f"Threaded Crossref fan-out: {len(links)} DOI(s), {metadata_workers} worker(s)")
+        with ThreadPoolExecutor(max_workers=min(metadata_workers, len(links))) as executor:
+            futures = {
+                executor.submit(fetch_metadata, index, link): index
+                for index, link in enumerate(links)
+            }
+            for completed, future in enumerate(as_completed(futures), 1):
+                index = futures[future]
+                try:
+                    _, metadata = future.result()
+                except Exception as exc:
+                    metadata = {"_metadata_error": str(exc)[:300]}
+                metadata_by_index[index] = metadata
+                if completed % 25 == 0 or completed == len(futures):
+                    print(f"OpenCitations metadata collected: {completed}/{len(futures)}")
+
+    # Barrier: do not build or merge citation rows until every metadata task completes.
     rows = []
     for index, link in enumerate(links):
         doi = clean_doi(link.get("citing", ""))
-        metadata = crossref_citing_metadata(session, doi) if doi else {}
+        metadata = metadata_by_index.get(index, {})
         authors = []
         for author in metadata.get("author", []) or []:
             name = " ".join(filter(None, [author.get("given", ""), author.get("family", "")])).strip()
@@ -1198,8 +1400,6 @@ def opencitations_fetch_citations(
                 "abstract": metadata.get("abstract") or "",
             }
         )
-        if index and index % 20 == 0:
-            time.sleep(0.2)
     return rows
 
 
@@ -1684,6 +1884,97 @@ def score_google_target(block, identifier: str, rank: int) -> float:
     )
 
 
+def explicit_google_scholar_target(
+    driver,
+    identifier: str,
+    target_url: str,
+    min_delay: float,
+    max_delay: float,
+    captcha_action: str,
+    debug_dir: Path,
+    diagnostics: Dict[str, Any],
+    captcha_timeout: float,
+) -> Tuple[Optional[str], bool, Optional[int]]:
+    parsed_url = urllib.parse.urlparse(target_url)
+    if parsed_url.scheme not in {"http", "https"} or parsed_url.netloc != "scholar.google.com":
+        raise RuntimeError("--scholar-target-url must use https://scholar.google.com.")
+
+    cited_by_url = normalize_scholar_results_url(target_url, require_cites=True)
+    if cited_by_url:
+        diagnostics.update(
+            {
+                "target_found": True,
+                "target_title": identifier,
+                "target_score": "explicit-cited-by-url",
+                "target_cited_by_url": cited_by_url,
+                "reported_cited_by_count": "",
+            }
+        )
+        append_scholar_event(
+            diagnostics["events"],
+            "explicit_cited_by_url_accepted",
+            driver,
+            cited_by_url=cited_by_url,
+        )
+        return cited_by_url, True, None
+
+    if parsed_url.path != "/citations" or not scholar_query_value(target_url, "citation_for_view"):
+        raise RuntimeError(
+            "--scholar-target-url must be a Scholar citation detail page or a /scholar?cites=... page."
+        )
+
+    append_scholar_event(
+        diagnostics["events"],
+        "explicit_target_page_start",
+        driver,
+        requested_url=target_url,
+    )
+    driver.get(target_url)
+    time.sleep(random.uniform(min_delay, max_delay))
+    if wait_for_scholar_captcha(
+        driver,
+        target_url,
+        captcha_action,
+        debug_dir,
+        diagnostics["events"],
+        captcha_timeout,
+    ):
+        diagnostics["captcha_status"] = "resolved"
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    title_tag = soup.select_one("#gsc_oci_title")
+    target_title = title_tag.get_text(" ", strip=True) if title_tag else ""
+    score = max(
+        token_overlap(identifier, target_title),
+        SequenceMatcher(None, normalize_text(identifier), normalize_text(target_title)).ratio(),
+    )
+    if not target_title or score < 0.70:
+        raise RuntimeError(
+            "The explicit Google Scholar page does not confidently match the target paper "
+            f"(score={score:.3f}, title={target_title!r})."
+        )
+    cited_by_url, citation_count = find_cited_by_link(soup)
+    reported_total = parse_count(citation_count)
+    diagnostics.update(
+        {
+            "target_found": True,
+            "target_title": target_title,
+            "target_score": f"{score:.3f}",
+            "target_cited_by_url": cited_by_url,
+            "reported_cited_by_count": reported_total or "",
+        }
+    )
+    append_scholar_event(
+        diagnostics["events"],
+        "explicit_target_page_resolved",
+        driver,
+        target_title=target_title,
+        target_score=f"{score:.3f}",
+        cited_by_url=cited_by_url,
+        reported_cited_by_count=reported_total or "",
+    )
+    return cited_by_url or None, True, reported_total
+
+
 def google_cited_by_url(
     driver,
     identifier: str,
@@ -1694,9 +1985,23 @@ def google_cited_by_url(
     debug_dir: Path = Path("scholar_debug"),
     diagnostics: Optional[Dict[str, Any]] = None,
     captcha_timeout: float = 600.0,
+    target_url: str = "",
 ) -> Tuple[Optional[str], bool, Optional[int]]:
     diagnostics = diagnostics if diagnostics is not None else {"events": []}
     events = diagnostics.setdefault("events", [])
+    if target_url:
+        diagnostics["explicit_target_url"] = target_url
+        return explicit_google_scholar_target(
+            driver,
+            identifier,
+            target_url,
+            min_delay,
+            max_delay,
+            captcha_action,
+            debug_dir,
+            diagnostics,
+            captcha_timeout,
+        )
     for query in google_target_queries(identifier):
         url = scholar_url(query, locale)
         append_scholar_event(events, "target_search_start", driver, query=query, requested_url=url)
@@ -1764,6 +2069,7 @@ def google_scrape_citing(
     output: str | Path = ".",
     captcha_action: str = "wait",
     captcha_timeout: float = 600.0,
+    target_url: str = "",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     diagnostics: Dict[str, Any] = {
         "browser": browser,
@@ -1787,6 +2093,7 @@ def google_scrape_citing(
             debug_dir,
             diagnostics,
             captcha_timeout,
+            target_url,
         )
         if not target_found:
             raise RuntimeError("Could not find a matching target paper on Google Scholar.")
@@ -1841,6 +2148,20 @@ def google_scrape_citing(
                 empty_pages += 1
                 current_start = scholar_start(driver.current_url or current_url)
                 print(f"No Google Scholar result blocks found at start={current_start}: {driver.current_url}")
+                if current_start >= 100 and reported_total and len(rows) >= 100:
+                    diagnostics["status"] = "partial_google_result_cap"
+                    diagnostics["partial_failure"] = (
+                        f"Google Scholar reported {reported_total} citations but its public result "
+                        f"pagination exposed only {len(rows)} rows."
+                    )
+                    append_scholar_event(
+                        diagnostics["events"],
+                        "public_result_cap_reached",
+                        driver,
+                        rows=len(rows),
+                        reported_cited_by_count=reported_total,
+                    )
+                    break
                 if reported_total and len(rows) < target_total and empty_pages < 3:
                     current_url = scholar_results_url_with_start(driver.current_url or current_url, current_start + 10)
                     continue
@@ -2015,6 +2336,51 @@ def records_compatible(existing: Dict[str, Any], row: Dict[str, Any]) -> bool:
     return not (existing_doi and row_doi and existing_doi != row_doi)
 
 
+def merge_author_details_json(left: Any, right: Any) -> str:
+    merged: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for raw in (left, right):
+        try:
+            items = json.loads(str(raw or "")) if value_present(raw) else []
+        except json.JSONDecodeError:
+            items = []
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            key = normalize_text(item.get("name", ""))
+            if not key:
+                continue
+            if key not in merged:
+                merged[key] = dict(item)
+                merged[key]["institutions"] = list(item.get("institutions") or [])
+                order.append(key)
+                continue
+            existing = merged[key]
+            id_type = str(item.get("authorIdType") or "")
+            if id_type == "semantic-scholar" or not existing.get("authorId"):
+                existing["authorId"] = item.get("authorId", "")
+                existing["authorIdType"] = id_type
+            for field in ("semanticAuthorId", "openalexAuthorId"):
+                if item.get(field):
+                    existing[field] = item[field]
+            institutions = existing.setdefault("institutions", [])
+            seen_institutions = {
+                normalize_text(institution.get("name", ""))
+                for institution in institutions
+                if isinstance(institution, dict)
+            }
+            for institution in item.get("institutions") or []:
+                if not isinstance(institution, dict) or not institution.get("name"):
+                    continue
+                institution_key = normalize_text(institution.get("name", ""))
+                if institution_key and institution_key not in seen_institutions:
+                    institutions.append(institution)
+                    seen_institutions.add(institution_key)
+    return json.dumps([merged[key] for key in order], ensure_ascii=False) if order else ""
+
+
 def merge_record_into(existing: Dict[str, Any], row: Dict[str, Any]) -> None:
     platforms = source_platform_set(existing)
     platforms.update(source_platform_set(row))
@@ -2030,6 +2396,16 @@ def merge_record_into(existing: Dict[str, Any], row: Dict[str, Any]) -> None:
             continue
         row_value = row.get(col, "")
         existing_value = existing.get(col, "")
+        if col == "citing_authors_json":
+            merged_authors = merge_author_details_json(existing_value, row_value)
+            if merged_authors:
+                existing[col] = merged_authors
+            continue
+        if col == "citing_author_ids":
+            author_ids = set(filter(None, str(existing_value or "").split(";")))
+            author_ids.update(filter(None, str(row_value or "").split(";")))
+            existing[col] = ";".join(sorted(author_ids))
+            continue
         if col in GOOGLE_PREFERRED_COLUMNS and row_is_google and value_present(row_value):
             existing[col] = row_value
         elif not value_present(existing_value) and value_present(row_value):
@@ -2504,31 +2880,61 @@ def fetch_find_platform(
     output: str | Path,
     scholar_captcha_action: str,
     scholar_captcha_timeout: float,
+    metadata_workers: int,
+    metadata_rps: float,
+    use_async_http: bool,
+    source_failure_policy: str,
+    scholar_target_url: str = "",
 ) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
+    started = time.monotonic()
+
+    def finished(
+        platform_name: str,
+        platform_target: Dict[str, Any],
+        rows: List[Dict[str, Any]],
+        diagnostics: Dict[str, Any],
+    ) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
+        diagnostics = dict(diagnostics or {})
+        diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        return platform_name, platform_target, rows, diagnostics
+
     if platform == "semantic-scholar":
         session = make_session()
-        target = s2_resolve_paper(session, paper, api_key)
-        rows = s2_fetch_citations(session, target, max_papers, api_key)
-        return platform, target, rows, {"rows": len(rows), "status": "ok"}
+        max_retries = 1 if source_failure_policy == "skip" else 4
+        target = s2_resolve_paper(session, paper, api_key, max_retries=max_retries)
+        rows = s2_fetch_citations(session, target, max_papers, api_key, max_retries=max_retries)
+        return finished(platform, target, rows, {"rows": len(rows), "status": "ok"})
     if platform == "openalex":
         session = make_session()
-        target = openalex_resolve_paper(session, paper)
-        rows = openalex_fetch_citations(session, target, max_papers)
-        return platform, target, rows, {
+        target = openalex_resolve_paper(session, paper, source_failure_policy)
+        rows = openalex_fetch_citations(session, target, max_papers, source_failure_policy)
+        versions = target.get("_matched_versions") or []
+        return finished(platform, target, rows, {
             "rows": len(rows),
             "status": "ok",
             "reported_cited_by_count": target.get("cited_by_count", ""),
             "target_id": target.get("id", ""),
-        }
+            "matched_versions": versions,
+        })
     if platform == "opencitations":
         session = make_session()
         target = crossref_resolve_paper(session, paper)
-        rows = opencitations_fetch_citations(session, target, max_papers)
-        return platform, {}, rows, {
+        rows = opencitations_fetch_citations(
+            session,
+            target,
+            max_papers,
+            metadata_workers,
+            use_async_http,
+            source_failure_policy,
+            metadata_rps,
+        )
+        return finished(platform, {}, rows, {
             "rows": len(rows),
             "status": "ok",
             "target_doi": target.get("DOI", ""),
-        }
+            "metadata_workers": metadata_workers,
+            "async_http": use_async_http,
+        })
     if platform == "google-scholar":
         rows, diagnostics = google_scrape_citing(
             paper,
@@ -2540,12 +2946,77 @@ def fetch_find_platform(
             output,
             scholar_captcha_action,
             scholar_captcha_timeout,
+            scholar_target_url,
         )
-        return platform, {}, rows, diagnostics
+        return finished(platform, {}, rows, diagnostics)
     raise RuntimeError(f"Unsupported platform: {platform}")
 
 
+def discovery_cache_path(output: Path, platform: str) -> Path:
+    return output / "source_cache" / f"{safe_filename(platform)}.json"
+
+
+def save_discovery_cache(
+    output: Path,
+    paper: str,
+    result: Tuple[str, Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]],
+) -> None:
+    platform, target, rows, diagnostics = result
+    if not rows:
+        return
+    cache_path = discovery_cache_path(output, platform)
+    ensure_dir(cache_path.parent)
+    payload = {
+        "paper": paper,
+        "platform": platform,
+        "cached_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "target": target,
+        "rows": rows,
+        "diagnostics": diagnostics,
+    }
+    temp_path = cache_path.with_suffix(".tmp")
+    write_json(temp_path, payload)
+    temp_path.replace(cache_path)
+
+
+def load_discovery_cache(
+    output: Path,
+    paper: str,
+    platform: str,
+    max_age_hours: float,
+    source_error: str,
+) -> Optional[Tuple[str, Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]]:
+    cache_path = discovery_cache_path(output, platform)
+    if not cache_path.exists():
+        return None
+    age_hours = max(0.0, (time.time() - cache_path.stat().st_mtime) / 3600.0)
+    if max_age_hours >= 0 and age_hours > max_age_hours:
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if normalize_text(payload.get("paper", "")) != normalize_text(paper):
+        return None
+    rows = payload.get("rows") or []
+    if not isinstance(rows, list) or not rows:
+        return None
+    diagnostics = dict(payload.get("diagnostics") or {})
+    diagnostics.update(
+        {
+            "status": "cached_fallback",
+            "cached_fallback": True,
+            "cache_path": str(cache_path),
+            "cache_age_hours": round(age_hours, 3),
+            "live_source_error": source_error,
+            "rows": len(rows),
+        }
+    )
+    return platform, dict(payload.get("target") or {}), rows, diagnostics
+
+
 def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
+    stage_started = time.monotonic()
     output = ensure_dir(args.output)
     api_key = args.s2_api_key or os.environ.get(args.s2_api_key_env or "SEMANTIC_SCHOLAR_API_KEY", "")
     platforms = [p.strip() for p in args.platforms.split(",") if p.strip()]
@@ -2554,9 +3025,16 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
     platform_errors: List[Dict[str, str]] = []
     platform_stats: Dict[str, Dict[str, Any]] = {}
     platform_record_counts: Dict[str, int] = {}
-    find_workers = max(1, numeric_arg(args, "find_workers", 2, int))
-    scholar_captcha_action = getattr(args, "scholar_captcha_action", "wait") or "wait"
+    find_workers = max(1, numeric_arg(args, "find_workers", 4, int))
+    metadata_workers = max(1, numeric_arg(args, "metadata_workers", 12, int))
+    metadata_rps = max(0.1, numeric_arg(args, "metadata_rps", 5.0, float))
+    use_async_http = bool(getattr(args, "async_http", True))
+    source_failure_policy = str(getattr(args, "source_failure_policy", "skip") or "skip")
+    use_source_cache = bool(getattr(args, "source_cache", True))
+    source_cache_max_age_hours = numeric_arg(args, "source_cache_max_age_hours", 168.0, float)
+    scholar_captcha_action = getattr(args, "scholar_captcha_action", "fail") or "fail"
     scholar_captcha_timeout = numeric_arg(args, "scholar_captcha_timeout", 600.0, float)
+    scholar_target_url = str(getattr(args, "scholar_target_url", "") or "").strip()
     require_google_scholar = bool(getattr(args, "require_google_scholar", False))
 
     def handle_result(platform: str, platform_target: Dict[str, Any], platform_records: List[Dict[str, Any]], diagnostics: Dict[str, Any]) -> None:
@@ -2571,6 +3049,8 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
         platform_record_counts[platform] = len(platform_records)
         platform_stats[platform] = diagnostics or {"rows": len(platform_records)}
 
+    platform_results: Dict[str, Tuple[str, Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]] = {}
+    print(f"Discovery fan-out: {len(platforms)} source(s), {min(find_workers, len(platforms))} worker(s)")
     if find_workers > 1 and len(platforms) > 1:
         with ThreadPoolExecutor(max_workers=min(find_workers, len(platforms))) as executor:
             futures = {
@@ -2587,13 +3067,18 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
                     output,
                     scholar_captcha_action,
                     scholar_captcha_timeout,
+                    metadata_workers,
+                    metadata_rps,
+                    use_async_http,
+                    source_failure_policy,
+                    scholar_target_url,
                 ): platform
                 for platform in platforms
             }
             for future in as_completed(futures):
                 platform = futures[future]
                 try:
-                    handle_result(*future.result())
+                    platform_results[platform] = future.result()
                 except Exception as exc:
                     message = str(exc)
                     diagnostics = getattr(exc, "diagnostics", {}) or {}
@@ -2601,25 +3086,40 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
                         platform_stats[platform] = diagnostics
                         platform_record_counts[platform] = parse_int(diagnostics.get("rows"))
                     platform_errors.append({"platform": platform, "error": message})
-                    print(f"{platform} failed, continuing with other platforms: {message}", file=sys.stderr)
+                    cached = load_discovery_cache(
+                        output,
+                        args.paper,
+                        platform,
+                        source_cache_max_age_hours,
+                        message,
+                    ) if use_source_cache else None
+                    if cached:
+                        platform_results[platform] = cached
+                        print(f"{platform} failed; using its last successful cache snapshot.", file=sys.stderr)
+                    else:
+                        print(f"{platform} failed, continuing with other platforms: {message}", file=sys.stderr)
     else:
         for platform in platforms:
             try:
-                handle_result(
-                    *fetch_find_platform(
-                        platform,
-                        args.paper,
-                        args.max_papers,
-                        args.browser,
-                        args.min_delay,
-                        args.max_delay,
-                        args.scholar_locale,
-                        api_key,
-                        output,
-                        scholar_captcha_action,
-                        scholar_captcha_timeout,
-                    )
+                result = fetch_find_platform(
+                    platform,
+                    args.paper,
+                    args.max_papers,
+                    args.browser,
+                    args.min_delay,
+                    args.max_delay,
+                    args.scholar_locale,
+                    api_key,
+                    output,
+                    scholar_captcha_action,
+                    scholar_captcha_timeout,
+                    metadata_workers,
+                    metadata_rps,
+                    use_async_http,
+                    source_failure_policy,
+                    scholar_target_url,
                 )
+                platform_results[platform] = result
             except Exception as exc:
                 message = str(exc)
                 diagnostics = getattr(exc, "diagnostics", {}) or {}
@@ -2627,7 +3127,27 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
                     platform_stats[platform] = diagnostics
                     platform_record_counts[platform] = parse_int(diagnostics.get("rows"))
                 platform_errors.append({"platform": platform, "error": message})
-                print(f"{platform} failed, continuing with other platforms: {message}", file=sys.stderr)
+                cached = load_discovery_cache(
+                    output,
+                    args.paper,
+                    platform,
+                    source_cache_max_age_hours,
+                    message,
+                ) if use_source_cache else None
+                if cached:
+                    platform_results[platform] = cached
+                    print(f"{platform} failed; using its last successful cache snapshot.", file=sys.stderr)
+                else:
+                    print(f"{platform} failed, continuing with other platforms: {message}", file=sys.stderr)
+
+    # Barrier: all source tasks have completed. Only now merge platform outputs.
+    print("Discovery barrier reached; merging completed source results.")
+    for platform in platforms:
+        result = platform_results.get(platform)
+        if result:
+            handle_result(*result)
+            if use_source_cache and not (result[3] or {}).get("cached_fallback"):
+                save_discovery_cache(output, args.paper, result)
 
     if platform_errors:
         target["platform_errors"] = platform_errors
@@ -2647,6 +3167,14 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
         "find.rows": len(rows),
         "find.max_papers": args.max_papers,
         "find.workers": find_workers,
+        "find.metadata_workers": metadata_workers,
+        "find.metadata_rps": metadata_rps,
+        "find.async_http": use_async_http,
+        "find.source_failure_policy": source_failure_policy,
+        "find.source_cache": use_source_cache,
+        "find.source_cache_max_age_hours": source_cache_max_age_hours,
+        "find.scholar_target_url": scholar_target_url,
+        "find.stage_elapsed_seconds": round(time.monotonic() - stage_started, 3),
         "find.require_google_scholar": require_google_scholar,
         "find.scholar_captcha_action": scholar_captcha_action,
         "find.scholar_captcha_timeout": scholar_captcha_timeout,
@@ -2656,9 +3184,9 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
         "find.semantic_scholar.rows": semantic_rows,
         "find.openalex.rows": openalex_rows,
         "find.platform_record_counts_json": json.dumps(platform_record_counts, ensure_ascii=False),
+        "find.platform_stats_json": json.dumps(platform_stats, ensure_ascii=False),
     }
-    if platform_errors:
-        note_payload["find.platform_errors_json"] = json.dumps(platform_errors, ensure_ascii=False)
+    note_payload["find.platform_errors_json"] = json.dumps(platform_errors, ensure_ascii=False)
     if google_stats:
         note_payload.update(
             {
@@ -2731,7 +3259,34 @@ def cmd_find(args: argparse.Namespace) -> Tuple[Path, Path]:
     return target_path, citing_path
 
 
-def parse_author_json(value: Any) -> List[Dict[str, str]]:
+MAJOR_COMPANY_PATTERNS: Sequence[Tuple[str, re.Pattern[str]]] = (
+    ("Google/DeepMind", re.compile(r"\b(?:google|deepmind)\b", re.I)),
+    ("NVIDIA", re.compile(r"\bnvidia\b", re.I)),
+    ("Microsoft", re.compile(r"\bmicrosoft\b", re.I)),
+    ("Meta", re.compile(r"\b(?:meta platforms|facebook ai|facebook research|fair)\b", re.I)),
+    ("Amazon", re.compile(r"\bamazon\b", re.I)),
+    ("Apple", re.compile(r"\bapple\b", re.I)),
+    ("Adobe", re.compile(r"\badobe\b", re.I)),
+    ("Intel", re.compile(r"\bintel\b", re.I)),
+    ("IBM", re.compile(r"\bibm\b", re.I)),
+    ("ByteDance/TikTok", re.compile(r"\b(?:bytedance|tik\s*tok)\b", re.I)),
+    ("Tencent", re.compile(r"\btencent\b", re.I)),
+    ("Alibaba", re.compile(r"\b(?:alibaba|damo academy)\b", re.I)),
+    ("Huawei", re.compile(r"\bhuawei\b", re.I)),
+    ("Samsung", re.compile(r"\bsamsung\b", re.I)),
+    ("OpenAI", re.compile(r"\bopenai\b", re.I)),
+    ("Waymo", re.compile(r"\bwaymo\b", re.I)),
+    ("Baidu", re.compile(r"\bbaidu\b", re.I)),
+    ("Kuaishou", re.compile(r"\bkuaishou\b", re.I)),
+    ("Megvii", re.compile(r"\bmegvii\b", re.I)),
+)
+
+
+def major_companies_for_affiliation(affiliation: str) -> List[str]:
+    return [label for label, pattern in MAJOR_COMPANY_PATTERNS if pattern.search(str(affiliation or ""))]
+
+
+def parse_author_json(value: Any) -> List[Dict[str, Any]]:
     text = str(value or "").strip()
     if not text or text.lower() == "nan":
         return []
@@ -2744,7 +3299,36 @@ def parse_author_json(value: Any) -> List[Dict[str, str]]:
     out = []
     for item in payload:
         if isinstance(item, dict) and item.get("name"):
-            out.append({"name": str(item.get("name") or ""), "authorId": str(item.get("authorId") or "")})
+            institutions = []
+            for institution in item.get("institutions") or []:
+                if not isinstance(institution, dict) or not institution.get("name"):
+                    continue
+                institutions.append(
+                    {
+                        "name": str(institution.get("name") or ""),
+                        "id": str(institution.get("id") or ""),
+                        "type": str(institution.get("type") or ""),
+                        "country_code": str(institution.get("country_code") or ""),
+                    }
+                )
+            out.append(
+                {
+                    "name": str(item.get("name") or ""),
+                    "authorId": str(item.get("authorId") or ""),
+                    "authorIdType": str(item.get("authorIdType") or ""),
+                    "semanticAuthorId": str(
+                        item.get("semanticAuthorId")
+                        or (item.get("authorId") if item.get("authorIdType") == "semantic-scholar" else "")
+                        or ""
+                    ),
+                    "openalexAuthorId": str(
+                        item.get("openalexAuthorId")
+                        or (item.get("authorId") if item.get("authorIdType") == "openalex" else "")
+                        or ""
+                    ),
+                    "institutions": institutions,
+                }
+            )
     return out
 
 
@@ -2769,25 +3353,66 @@ def normalized_author_name(name: str) -> str:
     return normalize_text(name)
 
 
-def author_entries_for_row(row: Dict[str, Any]) -> List[Dict[str, str]]:
+def author_entries_for_row(row: Dict[str, Any]) -> List[Dict[str, Any]]:
     entries = parse_author_json(row.get("citing_authors_json"))
     if entries:
         return entries
-    return [{"name": name, "authorId": ""} for name in parse_google_author_names(row.get("citing_authors"))]
+    return [
+        {
+            "name": name,
+            "authorId": "",
+            "authorIdType": "",
+            "semanticAuthorId": "",
+            "openalexAuthorId": "",
+            "institutions": [],
+        }
+        for name in parse_google_author_names(row.get("citing_authors"))
+    ]
 
 
 def collect_author_candidates_from_papers(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], pd.DataFrame]:
     df = clean_frame_for_report(df, PAPER_COLUMNS)
-    parsed_rows: List[Tuple[Dict[str, Any], List[Dict[str, str]]]] = []
-    name_to_id_key: Dict[str, str] = {}
+    parsed_rows: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]] = []
     for row in df.to_dict("records"):
         entries = author_entries_for_row(row)
         parsed_rows.append((row, entries))
+
+    openalex_to_s2: Dict[str, str] = {}
+    for _, entries in parsed_rows:
+        for entry in entries:
+            semantic_author_id = str(entry.get("semanticAuthorId") or "").strip()
+            openalex_author_id = str(entry.get("openalexAuthorId") or "").strip()
+            if semantic_author_id and openalex_author_id:
+                openalex_to_s2[openalex_author_id] = semantic_author_id
+
+    identity_keys_by_name: Dict[str, set[str]] = {}
+    for _, entries in parsed_rows:
         for entry in entries:
             name_norm = normalized_author_name(entry.get("name", ""))
             author_id = str(entry.get("authorId") or "").strip()
-            if name_norm and author_id:
-                name_to_id_key.setdefault(name_norm, f"s2:{author_id}")
+            author_id_type = str(entry.get("authorIdType") or "").strip().lower()
+            semantic_author_id = str(entry.get("semanticAuthorId") or "").strip()
+            openalex_author_id = str(entry.get("openalexAuthorId") or "").strip()
+            if not semantic_author_id and author_id_type == "semantic-scholar":
+                semantic_author_id = author_id
+            if not openalex_author_id and author_id_type == "openalex":
+                openalex_author_id = author_id
+            if not semantic_author_id and openalex_author_id in openalex_to_s2:
+                semantic_author_id = openalex_to_s2[openalex_author_id]
+            identity_key = (
+                f"s2:{semantic_author_id}"
+                if semantic_author_id
+                else f"openalex:{openalex_author_id}"
+                if openalex_author_id
+                else ""
+            )
+            if name_norm and identity_key:
+                identity_keys_by_name.setdefault(name_norm, set()).add(identity_key)
+    name_to_id_key = {
+        name: next(iter(keys))
+        for name, keys in identity_keys_by_name.items()
+        if len(keys) == 1
+    }
 
     candidates: Dict[str, Dict[str, Any]] = {}
     for row, entries in parsed_rows:
@@ -2797,19 +3422,55 @@ def collect_author_candidates_from_papers(df: pd.DataFrame) -> Tuple[List[Dict[s
                 continue
             name_norm = normalized_author_name(name)
             author_id = str(entry.get("authorId") or "").strip()
-            key = f"s2:{author_id}" if author_id else name_to_id_key.get(name_norm, f"name:{name_norm}")
+            author_id_type = str(entry.get("authorIdType") or "").strip().lower()
+            semantic_author_id = str(entry.get("semanticAuthorId") or "").strip()
+            openalex_author_id = str(entry.get("openalexAuthorId") or "").strip()
+            if not semantic_author_id and author_id_type == "semantic-scholar":
+                semantic_author_id = author_id
+            if not openalex_author_id and author_id_type == "openalex":
+                openalex_author_id = author_id
+            if not semantic_author_id and openalex_author_id in openalex_to_s2:
+                semantic_author_id = openalex_to_s2[openalex_author_id]
+            own_id_key = (
+                f"s2:{semantic_author_id}"
+                if semantic_author_id
+                else f"openalex:{openalex_author_id}"
+                if openalex_author_id
+                else ""
+            )
+            key = own_id_key or name_to_id_key.get(name_norm, f"name:{name_norm}")
+            institutions = [
+                str(institution.get("name") or "").strip()
+                for institution in entry.get("institutions") or []
+                if isinstance(institution, dict) and institution.get("name")
+            ]
             item = candidates.setdefault(
                 key,
                 {
                     "author_key": key,
                     "name": name,
                     "normalized_name": name_norm,
-                    "semantic_author_id": author_id if author_id else "",
+                    "semantic_author_id": semantic_author_id,
+                    "openalex_author_id": openalex_author_id,
+                    "source_affiliations_list": [],
+                    "source_company_affiliations_list": [],
+                    "company_affiliation_evidence_list": [],
                     "papers": [],
                 },
             )
-            if author_id and not item.get("semantic_author_id"):
-                item["semantic_author_id"] = author_id
+            if semantic_author_id and not item.get("semantic_author_id"):
+                item["semantic_author_id"] = semantic_author_id
+            if openalex_author_id and not item.get("openalex_author_id"):
+                item["openalex_author_id"] = openalex_author_id
+            for institution in institutions:
+                append_unique(item["source_affiliations_list"], institution, limit=30)
+                for company in major_companies_for_affiliation(institution):
+                    append_unique(item["source_company_affiliations_list"], company, limit=20)
+                    append_unique(
+                        item["company_affiliation_evidence_list"],
+                        f"{company}: {institution} @ {row.get('citing_title', '')}",
+                        limit=30,
+                    )
             if len(name) > len(str(item.get("name") or "")):
                 item["name"] = name
             item["papers"].append(
@@ -2828,6 +3489,9 @@ def collect_author_candidates_from_papers(df: pd.DataFrame) -> Tuple[List[Dict[s
         item["citing_paper_count"] = len(item.get("papers", []))
         item["max_citing_paper_citation_count"] = max(paper_counts) if paper_counts else 0
         item["sum_citing_paper_citation_count"] = sum(paper_counts)
+        item["source_affiliations"] = " | ".join(item.pop("source_affiliations_list", []))
+        item["source_company_affiliations"] = " | ".join(item.pop("source_company_affiliations_list", []))
+        item["company_affiliation_evidence"] = " | ".join(item.pop("company_affiliation_evidence_list", []))
     return list(candidates.values()), df
 
 
@@ -2889,7 +3553,13 @@ def numeric_arg(args: argparse.Namespace, name: str, default: int | float, cast)
     return cast(value)
 
 
-def s2_author_metrics(session: requests.Session, author_id: str, name: str, api_key: str = "") -> Dict[str, Any]:
+def s2_author_metrics(
+    session: requests.Session,
+    author_id: str,
+    name: str,
+    api_key: str = "",
+    max_retries: int = 4,
+) -> Dict[str, Any]:
     fields = "name,citationCount,hIndex,paperCount,affiliations,url,homepage"
     try:
         if author_id:
@@ -2899,6 +3569,7 @@ def s2_author_metrics(session: requests.Session, author_id: str, name: str, api_
                 {"fields": fields},
                 api_key,
                 timeout=30,
+                max_retries=max_retries,
             )
             if response.ok:
                 return response.json()
@@ -2910,6 +3581,7 @@ def s2_author_metrics(session: requests.Session, author_id: str, name: str, api_
                 {"query": name, "limit": 5, "fields": fields},
                 api_key,
                 timeout=30,
+                max_retries=max_retries,
             )
             if response.ok:
                 candidates = response.json().get("data", [])
@@ -2926,9 +3598,51 @@ def s2_author_metrics(session: requests.Session, author_id: str, name: str, api_
     return {}
 
 
-def fetch_s2_author_metric(cache_key: str, candidate: Dict[str, Any], api_key: str = "") -> Tuple[str, Dict[str, Any]]:
+def fetch_s2_author_metric(
+    cache_key: str,
+    candidate: Dict[str, Any],
+    api_key: str = "",
+    max_retries: int = 4,
+) -> Tuple[str, Dict[str, Any]]:
     session = make_session()
-    return cache_key, s2_author_metrics(session, candidate.get("semantic_author_id", ""), candidate.get("name", ""), api_key)
+    try:
+        metrics = s2_author_metrics(
+            session,
+            candidate.get("semantic_author_id", ""),
+            candidate.get("name", ""),
+            api_key,
+            max_retries=max_retries,
+        )
+    except TypeError as exc:
+        # Preserve compatibility with existing integrations that monkeypatch the
+        # former four-argument helper signature.
+        if "max_retries" not in str(exc):
+            raise
+        metrics = s2_author_metrics(
+            session,
+            candidate.get("semantic_author_id", ""),
+            candidate.get("name", ""),
+            api_key,
+        )
+    return cache_key, metrics
+
+
+def is_transient_s2_error(message: str) -> bool:
+    lowered = str(message or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "429",
+            "too many requests",
+            " 500 ",
+            " 502 ",
+            " 503 ",
+            " 504 ",
+            "timed out",
+            "timeout",
+            "connection error",
+        )
+    )
 
 
 def google_author_candidates_from_soup(soup: BeautifulSoup) -> List[Dict[str, Any]]:
@@ -3256,6 +3970,7 @@ QUALITY_TIER_ORDER = {
     "elite_award": 4,
     "academy_member": 3,
     "ieee_fellow": 2,
+    "major_company": 2,
     "high_impact": 2,
     "other_notable": 1,
     "unverified": 0,
@@ -3268,10 +3983,17 @@ def classify_author_quality(
     selected_citations: Any,
     h_index: Any,
     is_notable: bool,
+    company_affiliation: str = "",
 ) -> Tuple[str, str, bool]:
     """Classify author quality conservatively from identity-verified evidence."""
     confidence = str(identity_confidence or "").lower()
-    identity_verified = confidence in {"high", "medium", "verified", "verified_by_profile_link"}
+    identity_verified = confidence in {
+        "high",
+        "medium",
+        "verified",
+        "verified_by_profile_link",
+        "verified_by_authorship",
+    }
     if identity_verified:
         match = ELITE_AWARD_RE.search(evidence or "")
         if match:
@@ -3282,6 +4004,8 @@ def classify_author_quality(
         match = re.search(r"\bIEEE Fellow\b", evidence or "", re.I)
         if match:
             return "ieee_fellow", match.group(0), True
+        if company_affiliation:
+            return "major_company", f"structured citing-paper affiliation: {company_affiliation}", True
     citations = parse_int(selected_citations)
     h_value = parse_int(h_index)
     if identity_verified and (citations >= 50000 or h_value >= 100):
@@ -3293,11 +4017,11 @@ def classify_author_quality(
 
 def quality_scope_accepts(tier: str, scope: str) -> bool:
     if scope == "high-value":
-        return tier in {"elite_award", "academy_member", "ieee_fellow"}
+        return tier in {"elite_award", "academy_member", "ieee_fellow", "major_company"}
     if scope == "elite":
         return tier in {"elite_award", "academy_member"}
     if scope == "high-impact":
-        return tier in {"elite_award", "academy_member", "high_impact"}
+        return tier in {"elite_award", "academy_member", "ieee_fellow", "major_company", "high_impact"}
     return tier != "unverified"
 
 ACADEMIC_HINT_RE = re.compile(
@@ -3844,12 +4568,13 @@ def homepage_profile_summary(
     affiliations: str = "",
     interests: str = "",
     source_context: str = "direct_homepage",
+    request_timeout: float = 20.0,
 ) -> Dict[str, Any]:
     url = plausible_personal_homepage_url(url)
     if not url:
         return {"homepage_query_status": "no_homepage_url", "enrichment_version": PROFILE_ENRICHMENT_VERSION}
     try:
-        response = session.get(url, timeout=20, allow_redirects=True)
+        response = session.get(url, timeout=request_timeout, allow_redirects=True)
         content_type = response.headers.get("content-type", "").lower()
         if not response.ok:
             return {
@@ -3980,6 +4705,10 @@ def score_author_homepage_candidate(name: str, url: str, title: str, snippet: st
         score += 2.0
     if re.search(r"\b(professor|researcher|scientist|phd|faculty|university|institute|lab)\b", " ".join([title, snippet]), re.I):
         score += 1.5
+    if any(domain in host for domain in ("ieee.org", "acm.org", "nae.edu", "nasonline.org", "royalsociety.org")):
+        score += 3.0
+    if re.search(r"\b(?:IEEE|ACM|AAAI|IAPR) Fellow\b|National Academy|Royal Society|Turing Award", " ".join([title, snippet]), re.I):
+        score += 3.0
     return score
 
 
@@ -3990,23 +4719,30 @@ def search_author_homepage_candidates(
     interests: str = "",
     limit: int = 8,
 ) -> List[Dict[str, Any]]:
-    queries = [
-        f'"{name}" professor researcher homepage',
-        f'"{name}" university faculty profile',
-    ]
+    queries = []
     if affiliations:
-        queries.insert(0, f'"{name}" "{str(affiliations).split(";")[0].strip()}"')
+        first_affiliation = re.split(r"[;|]", str(affiliations), maxsplit=1)[0].strip()
+        if first_affiliation:
+            queries.append(f'"{name}" "{first_affiliation}"')
+    queries.extend(
+        [
+            f'"{name}" "IEEE Fellow" OR "ACM Fellow" OR "National Academy" OR "Royal Society"',
+            f'"{name}" "AAAI Fellow" OR "IAPR Fellow" OR "Academia Europaea"',
+            f'"{name}" professor researcher homepage',
+            f'"{name}" university faculty profile',
+        ]
+    )
     if interests:
         first_interest = str(interests).split(";")[0].strip()
         if first_interest:
             queries.append(f'"{name}" "{first_interest}" researcher')
     candidates: Dict[str, Dict[str, Any]] = {}
-    for query in queries[:4]:
+    for query in queries[:2]:
         try:
             response = session.get(
                 "https://duckduckgo.com/html/",
                 params={"q": query},
-                timeout=20,
+                timeout=8,
             )
             if not response.ok:
                 continue
@@ -4040,7 +4776,7 @@ def homepage_search_summary(
     name: str,
     affiliations: str = "",
     interests: str = "",
-    max_candidates: int = 4,
+    max_candidates: int = 2,
 ) -> Dict[str, Any]:
     candidates = search_author_homepage_candidates(session, name, affiliations, interests, limit=max_candidates)
     if not candidates:
@@ -4058,11 +4794,14 @@ def homepage_search_summary(
             affiliations,
             interests,
             source_context="deep_search",
+            request_timeout=10,
         )
         profile["homepage_search_score"] = candidate.get("score", "")
         profile["homepage_search_title"] = candidate.get("title", "")
         profile["homepage_search_snippet"] = candidate.get("snippet", "")
         profiles.append(profile)
+        if profile.get("homepage_identity_status") == "verified" and profile.get("is_notable"):
+            break
     def profile_rank(profile: Dict[str, Any]) -> Tuple[int, int, int, float]:
         verified = profile.get("homepage_identity_status") == "verified"
         return (
@@ -4365,6 +5104,7 @@ def author_report_row(candidate: Dict[str, Any], wiki: Dict[str, Any]) -> Dict[s
         dict.fromkeys(
             part
             for part in [
+                str(candidate.get("source_affiliations") or "").strip(),
                 str(candidate.get("semantic_scholar_affiliations") or "").strip(),
                 str(candidate.get("google_scholar_affiliation") or "").strip(),
             ]
@@ -4379,8 +5119,10 @@ def author_report_row(candidate: Dict[str, Any], wiki: Dict[str, Any]) -> Dict[s
     if not homepage_url and not homepage:
         homepage_url = homepage_url_for_author(candidate)
     homepage_evidence = homepage.get("homepage_evidence", "")
-    if profile_affiliations:
+    if candidate.get("semantic_scholar_affiliations") or candidate.get("google_scholar_affiliation"):
         evidence_sources.append("semantic_scholar/google_scholar_profile")
+    if candidate.get("source_affiliations"):
+        evidence_sources.append("structured_citing_authorship")
     if research_interests:
         evidence_sources.append("google_scholar_profile")
     if homepage_url or (homepage_verified and homepage_evidence):
@@ -4396,6 +5138,7 @@ def author_report_row(candidate: Dict[str, Any], wiki: Dict[str, Any]) -> Dict[s
         wiki.get("notability_confidence", "")
         or homepage.get("homepage_identity_status", "")
         or homepage.get("homepage_name_confidence", "")
+        or ("verified_by_authorship" if candidate.get("source_company_affiliations") else "")
     )
     quality_evidence = merge_evidence_field(
         honors_awards,
@@ -4410,6 +5153,7 @@ def author_report_row(candidate: Dict[str, Any], wiki: Dict[str, Any]) -> Dict[s
         candidate.get("selected_citation_count"),
         candidate.get("semantic_scholar_h_index"),
         is_notable,
+        str(candidate.get("source_company_affiliations") or ""),
     )
     if wiki:
         expert_query_status = "notable" if is_notable else (wiki.get("expert_query_status") or "queried")
@@ -4456,10 +5200,24 @@ def author_report_row(candidate: Dict[str, Any], wiki: Dict[str, Any]) -> Dict[s
     return row
 
 
-def author_key_for_entry(entry: Dict[str, str], name_to_key: Dict[str, str]) -> str:
+def author_key_for_entry(
+    entry: Dict[str, str],
+    name_to_key: Dict[str, str],
+    semantic_to_key: Optional[Dict[str, str]] = None,
+    openalex_to_key: Optional[Dict[str, str]] = None,
+) -> str:
     author_id = str(entry.get("authorId") or "").strip()
-    if author_id:
-        return f"s2:{author_id}"
+    author_id_type = str(entry.get("authorIdType") or "").strip().lower()
+    semantic_author_id = str(entry.get("semanticAuthorId") or "").strip()
+    openalex_author_id = str(entry.get("openalexAuthorId") or "").strip()
+    if not semantic_author_id and author_id_type == "semantic-scholar":
+        semantic_author_id = author_id
+    if not openalex_author_id and author_id_type == "openalex":
+        openalex_author_id = author_id
+    if semantic_author_id:
+        return (semantic_to_key or {}).get(semantic_author_id, f"s2:{semantic_author_id}")
+    if openalex_author_id:
+        return (openalex_to_key or {}).get(openalex_author_id, f"openalex:{openalex_author_id}")
     name_norm = normalized_author_name(entry.get("name", ""))
     return name_to_key.get(name_norm, f"name:{name_norm}")
 
@@ -4470,10 +5228,25 @@ def build_paper_author_outputs(
     author_report_by_key: Dict[str, Dict[str, Any]],
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     author_by_key = {item["author_key"]: item for item in enriched}
+    name_key_groups: Dict[str, set[str]] = {}
+    for item in enriched:
+        normalized_name = str(item.get("normalized_name") or "")
+        if normalized_name:
+            name_key_groups.setdefault(normalized_name, set()).add(item["author_key"])
     name_to_key = {
-        str(item.get("normalized_name") or ""): item["author_key"]
+        name: next(iter(keys))
+        for name, keys in name_key_groups.items()
+        if len(keys) == 1
+    }
+    semantic_to_key = {
+        str(item.get("semantic_author_id")): item["author_key"]
         for item in enriched
-        if item.get("normalized_name")
+        if item.get("semantic_author_id")
+    }
+    openalex_to_key = {
+        str(item.get("openalex_author_id")): item["author_key"]
+        for item in enriched
+        if item.get("openalex_author_id")
     }
     paper_author_rows: List[Dict[str, Any]] = []
     updated_papers: List[Dict[str, Any]] = []
@@ -4482,7 +5255,7 @@ def build_paper_author_outputs(
         candidates_for_paper: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
         target_count = 0
         for order, entry in enumerate(entries, 1):
-            key = author_key_for_entry(entry, name_to_key)
+            key = author_key_for_entry(entry, name_to_key, semantic_to_key, openalex_to_key)
             author = author_by_key.get(key, {})
             report_row = author_report_by_key.get(key, {})
             is_target = bool(author.get("is_target_author"))
@@ -4497,7 +5270,11 @@ def build_paper_author_outputs(
                 "author_key": key,
                 "name": author.get("name", entry.get("name", "")),
                 "normalized_name": author.get("normalized_name", normalized_author_name(entry.get("name", ""))),
-                "semantic_author_id": author.get("semantic_author_id", entry.get("authorId", "")),
+                "semantic_author_id": author.get("semantic_author_id", ""),
+                "openalex_author_id": author.get("openalex_author_id", ""),
+                "source_affiliations": author.get("source_affiliations", ""),
+                "source_company_affiliations": author.get("source_company_affiliations", ""),
+                "company_affiliation_evidence": author.get("company_affiliation_evidence", ""),
                 "is_target_author": is_target,
                 "target_author_match": author.get("target_author_match", ""),
                 "selected_citation_count": author.get("selected_citation_count", ""),
@@ -4589,6 +5366,7 @@ def top_author_keys_for_papers(papers: pd.DataFrame, enriched: List[Dict[str, An
 
 
 def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
+    stage_started = time.monotonic()
     output = ensure_dir(args.output)
     papers = read_papers(output)
     if papers.empty:
@@ -4611,10 +5389,12 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     max_delay = numeric_arg(args, "max_delay", 3.0, float)
     top_n = numeric_arg(args, "author_top_n", 20, int)
     max_profiles = numeric_arg(args, "max_author_profiles", 200, int)
-    author_workers = max(1, numeric_arg(args, "author_workers", 4, int))
-    wiki_workers = max(1, numeric_arg(args, "wiki_workers", 2, int))
-    homepage_search_limit = max(0, numeric_arg(args, "homepage_search_limit", 50, int))
-    author_quality_scope = str(getattr(args, "author_quality_scope", "high-value") or "high-value")
+    author_workers = max(1, numeric_arg(args, "author_workers", 8, int))
+    wiki_workers = max(1, numeric_arg(args, "wiki_workers", 4, int))
+    homepage_search_limit = max(0, numeric_arg(args, "homepage_search_limit", 250, int))
+    author_quality_scope = str(getattr(args, "author_quality_scope", "high-impact") or "high-impact")
+    author_failure_policy = str(getattr(args, "author_failure_policy", "skip") or "skip")
+    author_max_retries = 1 if author_failure_policy == "skip" else 4
     skip_google_scholar_authors = bool(getattr(args, "skip_google_scholar_authors", False))
     if max_delay < min_delay:
         max_delay = min_delay
@@ -4639,15 +5419,50 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     for candidate in candidates:
         candidate["profile_query_status"] = "queried" if candidate["author_key"] in profile_keys else "not_queried_profile_limit"
         cache_key = author_metric_cache_key(candidate, candidate["name"])
-        if candidate["author_key"] in profile_keys and cache_key not in s2_cache:
+        cached_metric = s2_cache.get(cache_key) or {}
+        if candidate["author_key"] in profile_keys and (
+            cache_key not in s2_cache or cached_metric.get("retryable")
+        ):
             metric_jobs.append((cache_key, candidate.copy()))
     queried_profiles = len(profile_keys)
+    s2_circuit_open = False
+    if metric_jobs and author_failure_policy == "skip":
+        probe_key, probe_candidate = metric_jobs.pop(0)
+        _, probe_metrics = fetch_s2_author_metric(
+            probe_key,
+            probe_candidate,
+            api_key,
+            max_retries=author_max_retries,
+        )
+        probe_error = str(probe_metrics.get("error") or "")
+        if probe_error and is_transient_s2_error(probe_error):
+            s2_circuit_open = True
+            probe_metrics["retryable"] = True
+            s2_cache[probe_key] = probe_metrics
+            for cache_key, _ in metric_jobs:
+                s2_cache[cache_key] = {
+                    "error": f"skipped_after_provider_failure: {probe_error}",
+                    "retryable": True,
+                }
+            print(
+                "Semantic Scholar author source unavailable; circuit opened after one probe "
+                f"and skipped {len(metric_jobs)} queued profile request(s)."
+            )
+            metric_jobs = []
+        else:
+            s2_cache[probe_key] = probe_metrics
     if metric_jobs:
         if author_workers > 1:
             completed = 0
             with ThreadPoolExecutor(max_workers=min(author_workers, len(metric_jobs))) as executor:
                 futures = {
-                    executor.submit(fetch_s2_author_metric, cache_key, candidate, api_key): cache_key
+                    executor.submit(
+                        fetch_s2_author_metric,
+                        cache_key,
+                        candidate,
+                        api_key,
+                        author_max_retries,
+                    ): cache_key
                     for cache_key, candidate in metric_jobs
                 }
                 for future in as_completed(futures):
@@ -4662,9 +5477,18 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
                         print(f"Semantic Scholar author profiles fetched: {completed}/{len(metric_jobs)}")
         else:
             for completed, (cache_key, candidate) in enumerate(metric_jobs, 1):
-                s2_cache[cache_key] = s2_author_metrics(make_session(), candidate.get("semantic_author_id", ""), candidate.get("name", ""), api_key)
+                _, metrics = fetch_s2_author_metric(
+                    cache_key,
+                    candidate,
+                    api_key,
+                    max_retries=author_max_retries,
+                )
+                s2_cache[cache_key] = metrics
                 if completed % 25 == 0 or completed == len(metric_jobs):
                     print(f"Semantic Scholar author profiles fetched: {completed}/{len(metric_jobs)}")
+
+    if metric_jobs:
+        print("Author-metric barrier reached; reducing profile metrics.")
 
     enriched: List[Dict[str, Any]] = []
     for idx, candidate in enumerate(candidates, 1):
@@ -4849,23 +5673,24 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
         candidate["rank"] = rank
 
     wiki_by_key: Dict[str, Dict[str, Any]] = {}
-    expert_rank_limit = max(100, top_n)
+    expert_rank_limit = max(0, top_n)
     top_paper_author_keys = top_author_keys_for_papers(papers, enriched)
     target_keys: List[str] = []
     seen_target_keys: set[str] = set()
-    for candidate in non_target_enriched[:expert_rank_limit]:
+    by_key = {candidate["author_key"]: candidate for candidate in non_target_enriched}
+    breadth_budget = min(expert_rank_limit, max(1, expert_rank_limit // 3)) if expert_rank_limit else 0
+    for key in top_paper_author_keys[:breadth_budget]:
+        if key in by_key and key not in seen_target_keys:
+            target_keys.append(key)
+            seen_target_keys.add(key)
+    for candidate in non_target_enriched:
         key = candidate["author_key"]
         if key not in seen_target_keys:
             target_keys.append(key)
             seen_target_keys.add(key)
-    by_key = {candidate["author_key"]: candidate for candidate in non_target_enriched}
-    for key in top_paper_author_keys:
-        if key in by_key and key not in seen_target_keys:
-            target_keys.append(key)
-            seen_target_keys.add(key)
-        if len(target_keys) >= 150:
+        if len(target_keys) >= expert_rank_limit:
             break
-    target_keys = target_keys[:150]
+    target_keys = target_keys[:expert_rank_limit]
     wiki_targets = [by_key[key] for key in target_keys if key in by_key]
     selected_wiki_keys = {candidate["author_key"] for candidate in wiki_targets}
     for candidate in non_target_enriched:
@@ -4918,6 +5743,7 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
             affiliations = " | ".join(
                 part
                 for part in [
+                    str(candidate.get("source_affiliations") or "").strip(),
                     str(candidate.get("semantic_scholar_affiliations") or "").strip(),
                     str(candidate.get("google_scholar_affiliation") or "").strip(),
                 ]
@@ -4969,6 +5795,7 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
         affiliations = " | ".join(
             part
             for part in [
+                str(candidate.get("source_affiliations") or "").strip(),
                 str(candidate.get("semantic_scholar_affiliations") or "").strip(),
                 str(candidate.get("google_scholar_affiliation") or "").strip(),
             ]
@@ -5110,6 +5937,8 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
             "authors.target_authors_excluded": sum(1 for item in enriched if item.get("is_target_author")),
             "authors.profile_queries": queried_profiles,
             "authors.semantic_scholar_workers": author_workers,
+            "authors.failure_policy": author_failure_policy,
+            "authors.semantic_scholar_circuit_open": s2_circuit_open,
             "authors.google_scholar.skip_author_profiles": skip_google_scholar_authors,
             "authors.google_scholar.browser": scholar_browser,
             "authors.google_scholar.captcha_action": scholar_captcha_action,
@@ -5124,15 +5953,23 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
             "authors.google_scholar.match_status_counts_json": json.dumps(google_match_counts, ensure_ascii=False),
             "authors.google_scholar.selected_count": google_selected_count,
             "authors.wikipedia_checked": len(wiki_targets),
-            "authors.wikipedia_scope": "top_100_non_target_plus_top_author_per_paper_cap_150",
+            "authors.wikipedia_scope": f"paper_breadth_one_third_plus_ranked_cap_{expert_rank_limit}",
             "authors.wikipedia_workers": wiki_workers,
             "authors.homepage_checked": len(homepage_jobs),
             "authors.homepage_search_checked": len(homepage_search_jobs),
+            "authors.deep_search_queries_per_author": 2,
+            "authors.deep_search_candidates_per_author": 2,
             "authors.quality_scope": author_quality_scope,
             "authors.high_quality_count": sum(1 for row in author_rows if row.get("is_high_quality")),
+            "authors.major_company_author_count": sum(1 for row in author_rows if row.get("author_quality_tier") == "major_company"),
+            "authors.quality_tier_counts_json": json.dumps(
+                pd.Series([row.get("author_quality_tier", "unverified") for row in author_rows]).value_counts().to_dict(),
+                ensure_ascii=False,
+            ),
             "authors.core_quality_citation_rows": len(notable_rows),
             "authors.expert_status_counts_json": json.dumps(expert_status_counts, ensure_ascii=False),
             "authors.expert_rejection_counts_json": json.dumps(expert_rejection_counts, ensure_ascii=False),
+            "authors.stage_elapsed_seconds": round(time.monotonic() - stage_started, 3),
         },
     )
     report = write_report(
@@ -5226,6 +6063,7 @@ def download_one_paper(
 
 
 def cmd_download(args: argparse.Namespace) -> Tuple[Path, Path]:
+    stage_started = time.monotonic()
     output = ensure_dir(args.output)
     pdf_dir = ensure_dir(output / "pdfs")
     input_value = getattr(args, "input", "") or ""
@@ -5238,7 +6076,7 @@ def cmd_download(args: argparse.Namespace) -> Tuple[Path, Path]:
     manifest: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
     manual_todo: List[Dict[str, Any]] = []
-    workers = max(1, int(getattr(args, "download_workers", 4) or 1))
+    workers = max(1, int(getattr(args, "download_workers", 8) or 1))
     arxiv_enabled = bool(getattr(args, "arxiv_fallback", True))
     total = len(df)
     jobs = [(idx, row.to_dict()) for idx, row in df.iterrows()]
@@ -5261,6 +6099,7 @@ def cmd_download(args: argparse.Namespace) -> Tuple[Path, Path]:
                 results.append(result)
                 print(result[4])
 
+    print("PDF download barrier reached; reducing manifest in source order.")
     for _, item, failure, todo, _ in sorted(results, key=lambda result: result[0]):
         manifest.append(item)
         if failure:
@@ -5280,6 +6119,7 @@ def cmd_download(args: argparse.Namespace) -> Tuple[Path, Path]:
             "download.downloaded": sum(1 for row in manifest if row.get("download_status") == "downloaded"),
             "download.failed": len(failures),
             "download.workers": workers,
+            "download.stage_elapsed_seconds": round(time.monotonic() - stage_started, 3),
         },
     )
     report = write_report(
@@ -5873,6 +6713,7 @@ def write_dashboard(output: Path) -> Path:
 
 
 def cmd_analyze(args: argparse.Namespace) -> Path:
+    stage_started = time.monotonic()
     output = ensure_dir(args.output)
     target = load_target_for_analysis(args)
     target_title = args.target_title or target.get("title") or ""
@@ -5882,17 +6723,45 @@ def cmd_analyze(args: argparse.Namespace) -> Path:
     rows = rows_for_analysis(args)
     contexts: List[Dict[str, Any]] = []
     coverage: List[Dict[str, Any]] = []
-    for idx, row in enumerate(rows, 1):
+    analyze_workers = max(1, numeric_arg(args, "analyze_workers", 4, int))
+
+    def analyze_job(index: int, row: Dict[str, Any]) -> Tuple[int, List[Dict[str, Any]], Dict[str, Any]]:
         try:
             hits, status = analyze_one_pdf(row, target, args.context_lines)
-            contexts.extend(hits)
-            coverage.append(status)
-            print(f"{idx}/{len(rows)} {status['analysis_status']}: {status['citing_title']} ({len(hits)} locations)")
+            return index, hits, status
         except Exception as exc:
             status = coverage_row(row, "pdf_parse_failed")
             status["failure_reason"] = str(exc)
-            coverage.append(status)
-            print(f"{idx}/{len(rows)} failed: {status['citing_title']}: {exc}", file=sys.stderr)
+            return index, [], status
+
+    analysis_results: Dict[int, Tuple[List[Dict[str, Any]], Dict[str, Any]]] = {}
+    if analyze_workers == 1 or len(rows) <= 1:
+        for index, row in enumerate(rows):
+            _, hits, status = analyze_job(index, row)
+            analysis_results[index] = (hits, status)
+    else:
+        print(f"PDF analysis fan-out: {len(rows)} file(s), {min(analyze_workers, len(rows))} worker(s)")
+        with ThreadPoolExecutor(max_workers=min(analyze_workers, len(rows))) as executor:
+            futures = {
+                executor.submit(analyze_job, index, row): index
+                for index, row in enumerate(rows)
+            }
+            for completed, future in enumerate(as_completed(futures), 1):
+                index, hits, status = future.result()
+                analysis_results[index] = (hits, status)
+                if completed % 10 == 0 or completed == len(futures):
+                    print(f"PDF analysis collected: {completed}/{len(futures)}")
+
+    # Barrier: preserve input order and write outputs only after all PDF workers finish.
+    print("PDF analysis barrier reached; reducing contexts and coverage.")
+    for index in range(len(rows)):
+        hits, status = analysis_results[index]
+        contexts.extend(hits)
+        coverage.append(status)
+        if status.get("analysis_status") == "pdf_parse_failed":
+            print(f"{index + 1}/{len(rows)} failed: {status['citing_title']}: {status.get('failure_reason', '')}", file=sys.stderr)
+        else:
+            print(f"{index + 1}/{len(rows)} {status['analysis_status']}: {status['citing_title']} ({len(hits)} locations)")
     if args.analysis_scope == "positive-only":
         contexts = [row for row in contexts if row.get("is_positive")]
     contexts_path = output / "citation_locations_reliable.csv"
@@ -5906,6 +6775,8 @@ def cmd_analyze(args: argparse.Namespace) -> Path:
             "analyze.location_rows": len(contexts),
             "analyze.cited_in_body": sum(1 for row in coverage if row.get("analysis_status") == "cited_in_body"),
             "analyze.scope": args.analysis_scope,
+            "analyze.workers": analyze_workers,
+            "analyze.stage_elapsed_seconds": round(time.monotonic() - stage_started, 3),
         },
     )
     report = write_report(
@@ -5993,6 +6864,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         wiki_workers=args.wiki_workers,
         homepage_search_limit=args.homepage_search_limit,
         author_quality_scope=args.author_quality_scope,
+        author_failure_policy=args.author_failure_policy,
         skip_google_scholar_authors=getattr(args, "skip_google_scholar_authors", False),
         export_legacy_csv=args.export_legacy_csv,
     )
@@ -6014,6 +6886,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         output=args.output,
         context_lines=args.context_lines,
         analysis_scope=args.analysis_scope,
+        analyze_workers=args.analyze_workers,
         export_legacy_csv=args.export_legacy_csv,
     )
     cmd_analyze(analyze_args)
@@ -6029,14 +6902,21 @@ def add_common_find_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-papers", type=int, default=1000, help="Maximum citing papers per platform (default: 1000)")
     parser.add_argument("--browser", choices=["chrome", "edge", "firefox"], default="edge")
     parser.add_argument("--scholar-locale", default="zh-CN", help="Google Scholar UI locale for search/cited-by pages (default: zh-CN)")
+    parser.add_argument("--scholar-target-url", default="", help="Optional exact Scholar citation-detail or cited-by URL; avoids ambiguous title lookup")
     parser.add_argument("--min-delay", type=float, default=1.0)
     parser.add_argument("--max-delay", type=float, default=3.0)
     parser.add_argument("--s2-api-key", default="")
     parser.add_argument("--s2-api-key-env", default="SEMANTIC_SCHOLAR_API_KEY")
-    parser.add_argument("--find-workers", type=int, default=2, help="Parallel platform workers for find; Google Scholar itself remains single-browser serial (default: 2)")
+    parser.add_argument("--find-workers", type=int, default=4, help="Parallel source workers for discovery fan-out (default: 4; Google Scholar itself remains serial)")
+    parser.add_argument("--metadata-workers", type=int, default=12, help="Concurrent Crossref metadata workers after OpenCitations discovery (default: 12)")
+    parser.add_argument("--metadata-rps", type=float, default=5.0, help="Maximum async Crossref request starts per second (default: 5)")
+    parser.add_argument("--async-http", action=argparse.BooleanOptionalAction, default=True, help="Use aiohttp connection pooling for Crossref metadata fan-out (default: enabled)")
+    parser.add_argument("--source-failure-policy", choices=["skip", "retry"], default="skip", help="On discovery 429/5xx/timeout, skip the source immediately or retry it (default: skip)")
+    parser.add_argument("--source-cache", action=argparse.BooleanOptionalAction, default=True, help="Reuse a recent successful source snapshot when that source is temporarily unavailable (default: enabled)")
+    parser.add_argument("--source-cache-max-age-hours", type=float, default=168.0, help="Maximum age of a discovery source cache snapshot (default: 168 hours)")
     parser.add_argument("--require-google-scholar", action="store_true", help="Fail the find/run if Google Scholar produces no citing rows")
     parser.add_argument("--minimum-source-success", type=int, default=2, help="Minimum citation platforms that must return records (default: 2)")
-    parser.add_argument("--scholar-captcha-action", choices=["wait", "fail"], default="wait", help="How to handle Google Scholar captcha pages (default: wait)")
+    parser.add_argument("--scholar-captcha-action", choices=["wait", "fail"], default="fail", help="How to handle Google Scholar captcha pages during discovery (default: fail and let other sources continue)")
     parser.add_argument("--scholar-captcha-timeout", type=float, default=600.0, help="Seconds to wait for manual Google Scholar captcha completion when action is wait (default: 600)")
     parser.add_argument("--export-legacy-csv", action="store_true", help="Also export legacy CSV/XLSX tables for debugging")
 
@@ -6054,10 +6934,11 @@ def add_common_author_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-delay", type=float, default=3.0)
     parser.add_argument("--s2-api-key", default="")
     parser.add_argument("--s2-api-key-env", default="SEMANTIC_SCHOLAR_API_KEY")
-    parser.add_argument("--author-workers", type=int, default=4, help="Parallel Semantic Scholar author profile workers (default: 4)")
-    parser.add_argument("--wiki-workers", type=int, default=2, help="Parallel Wikipedia/Wikidata profile workers (default: 2)")
+    parser.add_argument("--author-workers", type=int, default=8, help="Parallel Semantic Scholar author profile workers (default: 8)")
+    parser.add_argument("--author-failure-policy", choices=["skip", "retry"], default="skip", help="Probe and circuit-break the Semantic Scholar author source on temporary failures, or retry (default: skip)")
+    parser.add_argument("--wiki-workers", type=int, default=4, help="Parallel Wikipedia/Wikidata/homepage workers (default: 4)")
     parser.add_argument("--homepage-search-limit", type=int, default=250, help="Maximum expert-scope authors to search for personal/school homepages when profiles do not provide one (default: 250)")
-    parser.add_argument("--author-quality-scope", choices=["high-value", "elite", "high-impact", "all-notable"], default="high-value", help="Core citation rows: elite awards, academy members, and verified IEEE Fellows by default")
+    parser.add_argument("--author-quality-scope", choices=["high-value", "elite", "high-impact", "all-notable"], default="high-impact", help="Core citation rows: elite awards, academy/IEEE Fellows, major-company authors, and verified high-impact scholars by default")
     parser.add_argument("--export-legacy-csv", action="store_true", help="Also export legacy author CSV tables for debugging")
 
 
@@ -6073,7 +6954,7 @@ def build_parser() -> argparse.ArgumentParser:
     download_p.add_argument("--input", default="")
     download_p.add_argument("--output", required=True)
     download_p.add_argument("--arxiv-fallback", action=argparse.BooleanOptionalAction, default=True)
-    download_p.add_argument("--download-workers", type=int, default=4, help="Parallel PDF download workers (default: 4)")
+    download_p.add_argument("--download-workers", type=int, default=8, help="Parallel PDF download workers (default: 8)")
     download_p.add_argument("--export-legacy-csv", action="store_true", help="Also export legacy download CSV tables for debugging")
     download_p.set_defaults(func=cmd_download)
 
@@ -6089,6 +6970,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_p.add_argument("--output", required=True)
     analyze_p.add_argument("--context-lines", type=int, default=2)
     analyze_p.add_argument("--analysis-scope", choices=["all-contexts", "positive-only", "summary-only"], default="all-contexts")
+    analyze_p.add_argument("--analyze-workers", type=int, default=4, help="Parallel local PDF analysis workers (default: 4)")
     analyze_p.add_argument("--export-legacy-csv", action="store_true", help="Also export legacy analysis CSV/XLSX tables for debugging")
     analyze_p.set_defaults(func=cmd_analyze)
 
@@ -6099,15 +6981,17 @@ def build_parser() -> argparse.ArgumentParser:
     run_p = sub.add_parser("run", help="Run find, authors, download, analyze, and dashboard")
     add_common_find_args(run_p)
     run_p.add_argument("--arxiv-fallback", action=argparse.BooleanOptionalAction, default=True)
-    run_p.add_argument("--download-workers", type=int, default=4, help="Parallel PDF download workers (default: 4)")
+    run_p.add_argument("--download-workers", type=int, default=8, help="Parallel PDF download workers (default: 8)")
+    run_p.add_argument("--analyze-workers", type=int, default=4, help="Parallel local PDF analysis workers (default: 4)")
     run_p.add_argument("--context-lines", type=int, default=2)
     run_p.add_argument("--analysis-scope", choices=["all-contexts", "positive-only", "summary-only"], default="all-contexts")
     run_p.add_argument("--author-top-n", type=int, default=100, help="Priority authors to enrich with roster and biographical evidence (default: 100)")
     run_p.add_argument("--max-author-profiles", type=int, default=1000, help="Maximum author profiles to query across Semantic Scholar and Google Scholar (default: 1000)")
-    run_p.add_argument("--author-workers", type=int, default=4, help="Parallel Semantic Scholar author profile workers (default: 4)")
-    run_p.add_argument("--wiki-workers", type=int, default=2, help="Parallel Wikipedia/Wikidata profile workers (default: 2)")
+    run_p.add_argument("--author-workers", type=int, default=8, help="Parallel Semantic Scholar author profile workers (default: 8)")
+    run_p.add_argument("--author-failure-policy", choices=["skip", "retry"], default="skip", help="Probe and circuit-break the Semantic Scholar author source on temporary failures, or retry (default: skip)")
+    run_p.add_argument("--wiki-workers", type=int, default=4, help="Parallel Wikipedia/Wikidata/homepage workers (default: 4)")
     run_p.add_argument("--homepage-search-limit", type=int, default=250, help="Maximum expert-scope authors to search for personal/school homepages when profiles do not provide one (default: 250)")
-    run_p.add_argument("--author-quality-scope", choices=["high-value", "elite", "high-impact", "all-notable"], default="high-value", help="Core citation rows: elite awards, academy members, and verified IEEE Fellows by default")
+    run_p.add_argument("--author-quality-scope", choices=["high-value", "elite", "high-impact", "all-notable"], default="high-impact", help="Core citation rows: elite awards, academy/IEEE Fellows, major-company authors, and verified high-impact scholars by default")
     run_p.add_argument("--skip-google-scholar-authors", action="store_true", help="Skip Google Scholar author profile queries during run")
     # --export-legacy-csv is added by add_common_find_args.
     run_p.set_defaults(func=cmd_run)

@@ -1,0 +1,27 @@
+{
+  "benchmark": "MotionGPT AMiner-style report author overview",
+  "source": "MotionGPT_ Human Mot_2026年07月14日17时48分00秒.pdf",
+  "warning": "User-provided coverage reference, not independent proof of honors or identity",
+  "identities": [
+    {"name": "Li Fei-Fei", "affiliation": "Stanford University"},
+    {"name": "Trevor Darrell", "affiliation": "University of California Berkeley"},
+    {"name": "Jitendra Malik", "affiliation": "University of California Berkeley"},
+    {"name": "Tsung-Yi Lin", "affiliation": "NVIDIA"},
+    {"name": "Ming-Hsuan Yang", "affiliation": "University of California Merced"},
+    {"name": "Xiaogang Wang", "affiliation": "Chinese University of Hong Kong"},
+    {"name": "Richard Hartley", "affiliation": "Australian National University"},
+    {"name": "Dacheng Tao", "affiliation": "Nanyang Technological University"},
+    {"name": "Lei Zhang", "affiliation": "Hong Kong Polytechnic University"},
+    {"name": "Shuicheng Yan", "affiliation": "National University of Singapore"},
+    {"name": "Mubarak Shah", "affiliation": "University of Central Florida"},
+    {"name": "Chen Change Loy", "affiliation": "Nanyang Technological University"},
+    {"name": "Ziwei Liu", "affiliation": "Nanyang Technological University"},
+    {"name": "James Hays", "affiliation": "Georgia Institute of Technology"},
+    {"name": "Andreas Geiger", "affiliation": "University of Tuebingen"},
+    {"name": "Yi Yang", "affiliation": "Zhejiang University"},
+    {"name": "Xuelong Li", "affiliation": "Northwestern Polytechnical University"},
+    {"name": "Jiashi Feng", "affiliation": "TikTok"},
+    {"name": "Daniel Cohen-Or", "affiliation": "Tel Aviv University"},
+    {"name": "Lei Zhang", "affiliation": "International Digital Economy Academy"}
+  ]
+}

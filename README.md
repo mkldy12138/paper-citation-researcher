@@ -16,8 +16,12 @@
 - 默认要求至少两个引用数据库成功，并覆盖最多1000名引用作者；不会只核验高引用论文的前几十名作者。
 - 执行两轮以上候选核验和名册反向匹配，直到最后一轮不再发现新的高价值作者。
 - 输出覆盖率、作者展开率、全文获取率、正文评价率、主页率和未解决候选，避免用“查到多少算多少”冒充完整调查。
+- 使用有上限的分阶段并发：四个来源同时检索，Crossref元数据、作者画像、主页、PDF下载和正文分析分别并发；每阶段结束后统一汇总再进入下一阶段。
+- 来源遇到429、临时5xx或超时时立即隔离；若同一目标存在近期成功快照，则以 `cached_fallback` 明示回退，避免坏网络覆盖好结果。
 - 优先保留有正文证据的正面评价，并区分正面评价、方法采用/比较和普通提及。
 - 使用作者ID、机构、研究方向、论文署名和官方主页进行保守身份解析。
+- 保留 OpenAlex 的逐作者机构并与 Semantic Scholar 作者ID合并；同一引用记录中的 NVIDIA、Google/DeepMind、Microsoft、TikTok/ByteDance 等机构直接形成企业署名证据。
+- 对优先作者并发执行定向 Deep Search：姓名+机构、IEEE/ACM/AAAI Fellow、各国科学院/Royal Society，以及学校或个人主页。
 - 逐条核验院士、Fellow、奖项和企业归属，无法唯一对应时不纳入核心结果。
 - 自动生成 `citation_report.xlsx` 和可浏览的 HTML 调查面板。
 - 从经过验证的JSON生成中文PDF报告，包含总览表、逐人证据、企业作者、检索范围、限制和排除项。
@@ -49,7 +53,14 @@ python scripts/paper_citation_researcher.py run `
   --output ".\citation-output" `
   --max-papers 1000 `
   --browser edge `
-  --scholar-locale zh-CN
+  --scholar-locale zh-CN `
+  --find-workers 4 `
+  --metadata-workers 12 `
+  --metadata-rps 5 `
+  --author-workers 8 `
+  --wiki-workers 4 `
+  --download-workers 8 `
+  --analyze-workers 4
 ```
 
 分阶段运行：
@@ -60,6 +71,14 @@ python scripts/paper_citation_researcher.py authors --output ".\out"
 python scripts/paper_citation_researcher.py download --output ".\out"
 python scripts/paper_citation_researcher.py analyze --output ".\out"
 python scripts/paper_citation_researcher.py dashboard --output ".\out"
+```
+
+用户给出了 Google Scholar 论文详情页时，直接指定它以避免同题版本匹配失败：
+
+```powershell
+python scripts/paper_citation_researcher.py find `
+  --paper "<论文题名>" --output ".\out" `
+  --scholar-target-url "https://scholar.google.com/citations?...&citation_for_view=..."
 ```
 
 生成正式中文PDF：
@@ -77,6 +96,32 @@ PDF输入JSON格式见 `references/report-data-schema.md`。生成后应使用 P
 需要达到详细 AMiner 报告的信息量时，使用默认的三源检索与高覆盖参数，并遵循 `references/quality-and-coverage-standard.md`。信息量对齐的是检索深度和逐人证据密度，不会用仅有高 h 指数、但不属于院士/Fellow/顶级奖项/头部企业类别的普通作者凑数。
 
 Google Scholar 出现验证码时，默认保留浏览器窗口等待人工验证。若任务要求 Google Scholar 必须成功，增加 `--require-google-scholar`。
+
+并发架构、阶段屏障和限流调参见 `references/concurrency-model.md`。Excel、JSON、HTML和PDF始终在汇总阶段单线程写入，避免文件竞争。
+
+测试并发是否真正提速且不丢结果：
+
+```powershell
+python scripts/benchmark_concurrency.py `
+  --paper "<论文标题或DOI>" `
+  --output .\benchmark `
+  --platforms opencitations
+```
+
+输出的 `QPS` 是质量保持加速比；基准会禁用缓存，且只有串并发结果均非空、成功来源集合一致、引用集合 Jaccard 与作者元数据覆盖率均达到 0.99 时才计分，否则自动记为0。
+
+需要达到 MotionGPT 基准报告的人数和逐人证据密度时，参照 `references/motiongpt-benchmark-lessons.md`。默认 `--author-quality-scope high-impact` 会同时输出严格高价值作者、直接证实的头部企业作者和身份核验后的高影响力补充层；三类必须保留各自标签，不能混称院士或 Fellow。
+
+用 MotionGPT 参考集测量作者发现覆盖：
+
+```powershell
+python scripts/benchmark_author_coverage.py `
+  --workbook .\motiongpt-output\citation_report.xlsx `
+  --gold references\benchmarks\motiongpt-authors.json `
+  --output .\motiongpt-output\author_coverage_benchmark.json
+```
+
+`VHAR` 只在姓名/机构身份匹配、具体引用论文、非 `unverified` 质量分层以及主页或企业署名证据同时存在时计为命中。该参考集用于测覆盖，不代替独立头衔核验。
 
 ## 输入材料
 
