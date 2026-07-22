@@ -38,5 +38,8 @@ assert args.wiki_workers == 4
 assert args.download_workers == 8
 assert args.analyze_workers == 4
 assert args.author_quality_scope == "high-impact"
+assert args.download_scope == "high-value"
+assert args.formal_report is True
+assert args.strict_report is False
 
 print("OK high-coverage defaults")

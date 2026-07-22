@@ -40,7 +40,10 @@ Use UTF-8 JSON with this top-level shape:
       "context_assessment": "supported"},
     "citing_papers": [{"title": "...", "year": 2024, "venue": "...",
       "citation_count": 13, "target_citation_frequency": 1,
-      "url": "https://...", "context": "...", "context_status": "not-accessible"}]
+      "url": "https://...", "context": "...", "context_original": "...",
+      "citation_role": "method", "assessment_type": "positive_assessment",
+      "assessment_zh": "该引文在方法讨论中...", "positive_assessment": true,
+      "context_status": "verified"}]
   }],
   "companies": [{
     "company": "...", "name": "...", "raw_affiliation": "...",
@@ -60,6 +63,8 @@ Use UTF-8 JSON with this top-level shape:
 Allowed confidence values: `high`, `medium`. Low-confidence candidates belong in `diagnostics.excluded_candidates`.
 
 Allowed context states: `verified`, `reference-list-only`, `not-accessible`.
+
+Allowed citation roles: `method`, `background`, `baseline`, `dataset`. A `verified` context must include `context_original`, one allowed `citation_role`, and a conservative Chinese `assessment_zh`. Keep the original wording visible; never label a neutral context as positive merely because the paper cites the target.
 
 For every retained record, require a name, honor/company, confidence reason, at least one evidence URL, and at least one named citing paper. `homepage` may be empty only when no authoritative personal page was found and the confidence reason says so.
 

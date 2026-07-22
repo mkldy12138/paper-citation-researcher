@@ -53,6 +53,7 @@ def build(data, output):
     h1 = ParagraphStyle("H1CN", parent=styles["Title"], fontName="CN-Bold", fontSize=20, leading=28, textColor=colors.HexColor("#123B56"), alignment=TA_CENTER)
     h2 = ParagraphStyle("H2CN", parent=styles["Heading2"], fontName="CN-Bold", fontSize=13, leading=18, textColor=colors.HexColor("#0B6E69"), spaceBefore=8, spaceAfter=6)
     h3 = ParagraphStyle("H3CN", parent=h2, fontSize=10.5, leading=15, textColor=colors.HexColor("#123B56"))
+    quote = ParagraphStyle("QuoteCN", parent=body, fontSize=7.7, leading=12, leftIndent=4*mm, rightIndent=3*mm, borderColor=colors.HexColor("#AAB7B8"), borderWidth=0.5, borderPadding=5, backColor=colors.HexColor("#F4F7F7"), spaceBefore=2, spaceAfter=3)
     doc = SimpleDocTemplate(str(output), pagesize=A4, rightMargin=13*mm, leftMargin=13*mm, topMargin=15*mm, bottomMargin=15*mm, title=data["target"]["title"])
     story = [Spacer(1, 20*mm), Paragraph("高价值引用影响调查报告", h1), Spacer(1, 8*mm), Paragraph(esc(data["target"]["title"]), ParagraphStyle("T", parent=h2, alignment=TA_CENTER, fontSize=15, leading=22)), Spacer(1, 15*mm)]
     t = data["target"]
@@ -128,7 +129,16 @@ def build(data, output):
                     block.append(Paragraph(f"<b>引文指标：</b>{esc('；'.join(paper_metrics))}", body))
                 block.append(Paragraph(f"<b>论文链接：</b>{esc(p.get('url'))}", small))
                 status = {"verified":"正文引文已核验","reference-list-only":"仅参考文献表已核验","not-accessible":"全文未获取"}[p["context_status"]]
-                block.append(Paragraph(f"<b>引用位置：</b>{status}。{esc(p.get('context'))}", body))
+                if p["context_status"] == "verified":
+                    role = {"method":"方法引用","background":"背景/相关工作引用","baseline":"基线/比较引用","dataset":"数据集引用"}.get(p.get("citation_role"), "未分类")
+                    sentiment = "正面技术表述" if p.get("positive_assessment") else "中性引用"
+                    block.append(Paragraph(f"<b>证据状态：</b>{status}；{role}；{sentiment}", body))
+                else:
+                    block.append(Paragraph(f"<b>证据状态：</b>{status}", body))
+                if p.get("context_original") and p["context_status"] == "verified":
+                    block.append(Paragraph(f"<b>引用原文：</b>{esc(p.get('context_original'))}", quote))
+                if p.get("assessment_zh") and p["context_status"] == "verified":
+                    block.append(Paragraph(f"<b>中文说明：</b>{esc(p.get('assessment_zh'))}", body))
             block.append(Spacer(1, 4*mm))
             if kind == "scholar":
                 out.append(KeepTogether(block))
@@ -136,8 +146,14 @@ def build(data, output):
                 out.extend(block)
         return out
 
-    story += [Paragraph("三、重点学者逐人证据", h2)] + detail(data.get("scholars", []), "scholar")
-    story += [PageBreak(), Paragraph("四、企业作者逐人证据", h2)] + detail(data.get("companies", []), "company")
+    scholars = data.get("scholars", [])
+    companies = data.get("companies", [])
+    if scholars:
+        story += [Paragraph("三、重点学者逐人证据", h2)] + detail(scholars, "scholar")
+        if companies:
+            story.append(PageBreak())
+    if companies:
+        story += [Paragraph("四、企业作者逐人证据", h2)] + detail(companies, "company")
     d = data.get("diagnostics", {})
     story += [PageBreak(), Paragraph("五、检索范围与限制", h2)]
     for s in t.get("sources", []): story.append(Paragraph(f"<b>{esc(s['name'])}：</b>{esc(s.get('coverage'))}；{esc(s.get('url'))}", body))

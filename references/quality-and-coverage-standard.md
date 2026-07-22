@@ -62,6 +62,8 @@ Record these values in `coverage` within the formal-report JSON:
 
 Treat a discovered/report-count ratio below 0.65, fewer than two successful sources, missing author expansion, or a nonzero final-pass yield as incomplete. Do not describe an incomplete run as exhaustive.
 
+For detailed formal reports, at least 50% of retained people should have verified body context. Every verified context must retain the original passage, one role from `method`, `background`, `baseline`, or `dataset`, and a specific conservative Chinese technical explanation. An automatically generated role-only sentence is a draft, not a final assessment.
+
 ## Output Density
 
 For every retained person show: name, all verified high-value titles, h-index when identity-matched, personal citation count when source-matched, institution, exact citing-paper title, venue/year, citing-paper citation count, target-citation frequency, homepage, evidence URLs, confidence, five-claim verdicts, full body context when available, and a conservative Chinese assessment.

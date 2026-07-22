@@ -129,6 +129,8 @@ CONTEXT_COLUMNS = [
     "match_type",
     "confidence",
     "context",
+    "citation_role",
+    "assessment_type",
     "is_positive",
     "reference_marker",
     "reference_score",
@@ -2634,6 +2636,40 @@ def target_ids(target: Dict[str, Any]) -> List[str]:
     return ids
 
 
+def target_title_aliases(target: Dict[str, Any]) -> List[str]:
+    title = text_value(target.get("title") or target.get("display_name")).strip()
+    if not title:
+        return []
+    candidates = [title]
+    head = re.split(r"[:\-\u2010-\u2015]", title, maxsplit=1)[0].strip()
+    if head and len(head.split()) <= 8:
+        candidates.append(head)
+    candidates.extend(
+        match.group(0)
+        for match in re.finditer(r"\b[A-Za-z0-9]+(?:GPT|Former|Net|BERT|DARTS|CNN|VAE|LLM)\b", title)
+    )
+    aliases = []
+    seen = set()
+    for candidate in candidates:
+        normalized = normalize_text(candidate)
+        if len(normalized) < 4 or normalized in seen:
+            continue
+        seen.add(normalized)
+        aliases.append(candidate)
+    return aliases
+
+
+def classify_citation_role(context: str) -> str:
+    text = str(context or "")
+    if re.search(r"\b(dataset|corpus|training data|benchmark data|data collection|annotation)\b", text, re.I):
+        return "dataset"
+    if re.search(r"\b(baseline|benchmark(?:ed|ing)?|compar(?:e|ed|ison)|versus|vs\.?|outperform)\b", text, re.I):
+        return "baseline"
+    if re.search(r"\b(propose[sd]?|method|model|framework|architecture|adopt|use[sd]?|based on|builds? (?:on|upon)|inspired by|extend)\b", text, re.I):
+        return "method"
+    return "background"
+
+
 def reference_lines(lines_by_page: Sequence[Sequence[str]], boundary: Tuple[int, int]) -> List[Tuple[int, int, str]]:
     boundary_page, boundary_line = boundary
     if boundary_page >= len(lines_by_page):
@@ -2679,9 +2715,12 @@ def score_reference(entry_text: str, target: Dict[str, Any]) -> Tuple[float, Lis
     norm_title = normalize_text(title)
     score = 0.0
     evidence: List[str] = []
-    if "shapegpt" in norm_entry:
-        score += 8.0
-        evidence.append("contains ShapeGPT")
+    for alias in target_title_aliases(target):
+        normalized_alias = normalize_text(alias)
+        if normalized_alias and normalized_alias in norm_entry:
+            score += 8.0
+            evidence.append(f"contains target alias: {alias}")
+            break
     if norm_title and norm_title in norm_entry:
         score += 10.0
         evidence.append("contains normalized title")
@@ -2811,6 +2850,7 @@ def analyze_one_pdf(
         return [], coverage
 
     label = text_value(reference.get("label"))
+    aliases = target_title_aliases(target)
     reference_marker = f"[{label}]" if label else ""
     coverage.update(
         {
@@ -2830,8 +2870,10 @@ def analyze_one_pdf(
             matches: List[Tuple[str, str, float]] = []
             for marker in numeric_markers_in_line(line, label):
                 matches.append((marker, "verified numeric reference", 0.95))
-            if re.search(r"\bShapeGPT\b", line, flags=re.I):
-                matches.append(("ShapeGPT", "explicit ShapeGPT mention", 0.98))
+            for alias in aliases:
+                if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", line, flags=re.I):
+                    matches.append((alias, "explicit target-title mention", 0.98))
+                    break
             if not matches:
                 continue
 
@@ -2841,6 +2883,8 @@ def analyze_one_pdf(
                 if key in seen:
                     continue
                 seen.add(key)
+                citation_role = classify_citation_role(snippet)
+                is_positive = bool(POSITIVE_RE.search(snippet))
                 contexts.append(
                     {
                         "citing_title": text_value(row.get("citing_title")),
@@ -2854,7 +2898,9 @@ def analyze_one_pdf(
                         "match_type": match_type,
                         "confidence": confidence,
                         "context": snippet,
-                        "is_positive": bool(POSITIVE_RE.search(snippet)),
+                        "citation_role": citation_role,
+                        "assessment_type": "positive_assessment" if is_positive else citation_role,
+                        "is_positive": is_positive,
                         "reference_marker": reference_marker,
                         "reference_score": reference.get("score", ""),
                         "reference_evidence": reference.get("evidence", ""),
@@ -5368,6 +5414,17 @@ def top_author_keys_for_papers(papers: pd.DataFrame, enriched: List[Dict[str, An
 def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     stage_started = time.monotonic()
     output = ensure_dir(args.output)
+    previous_sheets = load_report_sheets(output)
+    previous_verified_keys = {
+        str(row.get("author_key") or "")
+        for row in previous_sheets["authors"].to_dict("records")
+        if str(row.get("author_quality_tier") or "unverified") != "unverified"
+    }
+    previous_pass_count = sum(
+        1
+        for row in previous_sheets["run_notes"].to_dict("records")
+        if str(row.get("key") or "").endswith(" authors.pass_number")
+    )
     papers = read_papers(output)
     if papers.empty:
         citing_path = output / "citing_papers.csv"
@@ -5929,10 +5986,18 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
         else {}
     )
     google_selected_count = sum(1 for item in non_target_enriched if item.get("selected_citation_source") == "google-scholar")
+    current_verified_keys = {
+        str(row.get("author_key") or "")
+        for row in author_rows
+        if str(row.get("author_quality_tier") or "unverified") != "unverified"
+    }
+    new_verified_people = len(current_verified_keys - previous_verified_keys)
     notes = append_run_notes(
         output,
         {
             "authors.total_candidates": len(enriched),
+            "authors.pass_number": previous_pass_count + 1,
+            "authors.new_verified_people_this_pass": new_verified_people,
             "authors.non_target_candidates": len(non_target_enriched),
             "authors.target_authors_excluded": sum(1 for item in enriched if item.get("is_target_author")),
             "authors.profile_queries": queried_profiles,
@@ -6062,17 +6127,57 @@ def download_one_paper(
         return idx, item, failure, manual_todo, f"{idx + 1}/{total} failed: {title[:80]}"
 
 
+def selected_high_value_papers(output: Path, papers: pd.DataFrame) -> pd.DataFrame:
+    notable = load_report_sheets(output)["notable_citations"]
+    if notable.empty or "citing_title" not in notable.columns:
+        return papers.iloc[0:0].copy()
+    selected_titles = {
+        normalize_text(title)
+        for title in notable["citing_title"].fillna("").astype(str)
+        if normalize_text(title)
+    }
+    return papers[
+        papers["citing_title"].fillna("").astype(str).map(normalize_text).isin(selected_titles)
+    ].copy()
+
+
+def merge_download_results_into_papers(
+    base: pd.DataFrame,
+    manifest: Sequence[Dict[str, Any]],
+) -> pd.DataFrame:
+    base = clean_frame_for_report(base, PAPER_COLUMNS)
+    if base.empty:
+        return clean_frame_for_report(pd.DataFrame(manifest), PAPER_COLUMNS)
+    updates = {
+        str(row.get("dedupe_key") or normalize_text(row.get("citing_title", ""))): row
+        for row in manifest
+    }
+    rows = []
+    for row in base.to_dict("records"):
+        key = str(row.get("dedupe_key") or normalize_text(row.get("citing_title", "")))
+        update = updates.get(key)
+        if update:
+            for column in DOWNLOAD_COLUMNS:
+                row[column] = update.get(column, "")
+        rows.append(row)
+    return clean_frame_for_report(pd.DataFrame(rows), PAPER_COLUMNS)
+
+
 def cmd_download(args: argparse.Namespace) -> Tuple[Path, Path]:
     stage_started = time.monotonic()
     output = ensure_dir(args.output)
     pdf_dir = ensure_dir(output / "pdfs")
     input_value = getattr(args, "input", "") or ""
     input_path = Path(input_value) if input_value else Path()
+    all_papers = read_papers(output)
     if input_value and input_path.is_file():
         df = pd.read_csv(input_path, dtype=str).fillna("")
     else:
-        df = read_papers(output)
+        df = all_papers
     df = clean_frame_for_report(df, PAPER_COLUMNS if "dedupe_key" in df.columns else CITING_COLUMNS)
+    download_scope = str(getattr(args, "download_scope", "all") or "all")
+    if download_scope == "high-value":
+        df = selected_high_value_papers(output, df)
     manifest: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
     manual_todo: List[Dict[str, Any]] = []
@@ -6110,12 +6215,13 @@ def cmd_download(args: argparse.Namespace) -> Tuple[Path, Path]:
     manifest_path = output / "download_manifest.csv"
     failures_path = output / "download_failures.csv"
     manual_todo_path = output / "manual_download_todo.csv"
-    papers = clean_frame_for_report(pd.DataFrame(manifest), PAPER_COLUMNS)
+    papers = merge_download_results_into_papers(all_papers if not all_papers.empty else df, manifest)
     manual = clean_frame_for_report(pd.DataFrame(manual_todo), MANUAL_COLUMNS)
     notes = append_run_notes(
         output,
         {
             "download.total": len(manifest),
+            "download.scope": download_scope,
             "download.downloaded": sum(1 for row in manifest if row.get("download_status") == "downloaded"),
             "download.failed": len(failures),
             "download.workers": workers,
@@ -6845,6 +6951,49 @@ def cmd_dashboard(args: argparse.Namespace) -> Path:
     return dashboard_path
 
 
+def cmd_report(args: argparse.Namespace) -> Path:
+    output = ensure_dir(args.output)
+    scripts_dir = Path(__file__).resolve().parent
+    workbook = output / "citation_report.xlsx"
+    report_json = Path(getattr(args, "report_json", "") or output / "report.json")
+    report_pdf = Path(
+        getattr(args, "report_pdf", "")
+        or output / "pdf" / "high-value-citation-report.pdf"
+    )
+    if not workbook.is_file():
+        raise RuntimeError(f"Citation workbook not found: {workbook}")
+    subprocess.run(
+        [
+            sys.executable,
+            str(scripts_dir / "build_report_data.py"),
+            "--workbook",
+            str(workbook),
+            "--output",
+            str(report_json),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [sys.executable, str(scripts_dir / "validate_report_data.py"), str(report_json)],
+        check=True,
+    )
+    audit_command = [
+        sys.executable,
+        str(scripts_dir / "audit_report_quality.py"),
+        str(report_json),
+    ]
+    if getattr(args, "strict_report", False):
+        audit_command.append("--strict")
+    subprocess.run(audit_command, check=True)
+    subprocess.run(
+        [sys.executable, str(scripts_dir / "render_report.py"), str(report_json), str(report_pdf)],
+        check=True,
+    )
+    print(f"Saved formal report data: {report_json}")
+    print(f"Saved formal PDF report: {report_pdf}")
+    return report_pdf
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     find_args = argparse.Namespace(**vars(args))
     _, citing_path = cmd_find(find_args)
@@ -6875,6 +7024,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         output=args.output,
         arxiv_fallback=args.arxiv_fallback,
         download_workers=args.download_workers,
+        download_scope=args.download_scope,
         export_legacy_csv=args.export_legacy_csv,
     )
     cmd_download(download_args)
@@ -6893,6 +7043,15 @@ def cmd_run(args: argparse.Namespace) -> None:
     print("Refreshing author enrichment with citation-location coverage.")
     cmd_authors(author_args)
     cmd_dashboard(argparse.Namespace(output=args.output))
+    if args.formal_report:
+        cmd_report(
+            argparse.Namespace(
+                output=args.output,
+                report_json=args.report_json,
+                report_pdf=args.report_pdf,
+                strict_report=args.strict_report,
+            )
+        )
 
 
 def add_common_find_args(parser: argparse.ArgumentParser) -> None:
@@ -6955,6 +7114,7 @@ def build_parser() -> argparse.ArgumentParser:
     download_p.add_argument("--output", required=True)
     download_p.add_argument("--arxiv-fallback", action=argparse.BooleanOptionalAction, default=True)
     download_p.add_argument("--download-workers", type=int, default=8, help="Parallel PDF download workers (default: 8)")
+    download_p.add_argument("--download-scope", choices=["all", "high-value"], default="all", help="Download every citing paper or only papers represented in notable_citations (default: all)")
     download_p.add_argument("--export-legacy-csv", action="store_true", help="Also export legacy download CSV tables for debugging")
     download_p.set_defaults(func=cmd_download)
 
@@ -6978,13 +7138,25 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_p.add_argument("--output", required=True)
     dashboard_p.set_defaults(func=cmd_dashboard)
 
+    report_p = sub.add_parser("report", help="Build a validated Chinese PDF from an existing citation_report.xlsx")
+    report_p.add_argument("--output", required=True, help="Output directory containing citation_report.xlsx")
+    report_p.add_argument("--report-json", default="", help="Optional report JSON path (default: OUTPUT/report.json)")
+    report_p.add_argument("--report-pdf", default="", help="Optional PDF path (default: OUTPUT/pdf/high-value-citation-report.pdf)")
+    report_p.add_argument("--strict-report", action="store_true", help="Fail if high-coverage quality thresholds are not met")
+    report_p.set_defaults(func=cmd_report)
+
     run_p = sub.add_parser("run", help="Run find, authors, download, analyze, and dashboard")
     add_common_find_args(run_p)
     run_p.add_argument("--arxiv-fallback", action=argparse.BooleanOptionalAction, default=True)
     run_p.add_argument("--download-workers", type=int, default=8, help="Parallel PDF download workers (default: 8)")
+    run_p.add_argument("--download-scope", choices=["all", "high-value"], default="high-value", help="Download every citing paper or only retained high-value citing papers (default: high-value)")
     run_p.add_argument("--analyze-workers", type=int, default=4, help="Parallel local PDF analysis workers (default: 4)")
     run_p.add_argument("--context-lines", type=int, default=2)
     run_p.add_argument("--analysis-scope", choices=["all-contexts", "positive-only", "summary-only"], default="all-contexts")
+    run_p.add_argument("--formal-report", action=argparse.BooleanOptionalAction, default=True, help="Build validated report.json and Chinese PDF after analysis (default: enabled)")
+    run_p.add_argument("--report-json", default="", help="Optional report JSON path (default: OUTPUT/report.json)")
+    run_p.add_argument("--report-pdf", default="", help="Optional PDF path (default: OUTPUT/pdf/high-value-citation-report.pdf)")
+    run_p.add_argument("--strict-report", action="store_true", help="Fail the run when high-coverage quality thresholds are not met")
     run_p.add_argument("--author-top-n", type=int, default=100, help="Priority authors to enrich with roster and biographical evidence (default: 100)")
     run_p.add_argument("--max-author-profiles", type=int, default=1000, help="Maximum author profiles to query across Semantic Scholar and Google Scholar (default: 1000)")
     run_p.add_argument("--author-workers", type=int, default=8, help="Parallel Semantic Scholar author profile workers (default: 8)")

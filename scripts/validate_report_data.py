@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 
 ALLOWED_CONFIDENCE = {"high", "medium"}
 ALLOWED_CONTEXT = {"verified", "reference-list-only", "not-accessible"}
+ALLOWED_ROLES = {"method", "background", "baseline", "dataset"}
 ALLOWED_VERDICTS = {"supported", "partially-supported", "uncertain", "unsupported"}
 REQUIRED_CLAIMS = {"authorship", "target_citation", "honor_or_company", "homepage_identity", "context_assessment"}
 BAD_TEXT = ("见pdf", "自动解析", "未自动拆分", "未能唯一对应", "TODO")
@@ -52,6 +53,13 @@ def main(path):
                 if not paper.get("title"): errors.append(f"{prefix}.citing_papers[{j}].title is required")
                 if paper.get("context_status") not in ALLOWED_CONTEXT:
                     errors.append(f"{prefix}.citing_papers[{j}].context_status is invalid")
+                if paper.get("context_status") == "verified":
+                    if not paper.get("context_original"):
+                        errors.append(f"{prefix}.citing_papers[{j}].context_original is required for verified context")
+                    if paper.get("citation_role") not in ALLOWED_ROLES:
+                        errors.append(f"{prefix}.citing_papers[{j}].citation_role is invalid")
+                    if not paper.get("assessment_zh"):
+                        errors.append(f"{prefix}.citing_papers[{j}].assessment_zh is required for verified context")
     blob = json.dumps(data, ensure_ascii=False)
     for phrase in BAD_TEXT:
         if phrase.lower() in blob.lower(): errors.append(f"forbidden placeholder text: {phrase}")

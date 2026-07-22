@@ -25,6 +25,7 @@
 - 逐条核验院士、Fellow、奖项和企业归属，无法唯一对应时不纳入核心结果。
 - 自动生成 `citation_report.xlsx` 和可浏览的 HTML 调查面板。
 - 从经过验证的JSON生成中文PDF报告，包含总览表、逐人证据、企业作者、检索范围、限制和排除项。
+- 正式报告坚持“一人一节、一篇引文一条证据”，同时呈现引用原文、方法/背景/基线/数据集类型和中文技术说明。
 - 支持多篇论文，每篇论文独立分表，不把所有姓名混在同一张表中。
 
 ## 安装
@@ -71,6 +72,7 @@ python scripts/paper_citation_researcher.py authors --output ".\out"
 python scripts/paper_citation_researcher.py download --output ".\out"
 python scripts/paper_citation_researcher.py analyze --output ".\out"
 python scripts/paper_citation_researcher.py dashboard --output ".\out"
+python scripts/paper_citation_researcher.py report --output ".\out" --strict-report
 ```
 
 用户给出了 Google Scholar 论文详情页时，直接指定它以避免同题版本匹配失败：
@@ -81,14 +83,13 @@ python scripts/paper_citation_researcher.py find `
   --scholar-target-url "https://scholar.google.com/citations?...&citation_for_view=..."
 ```
 
-生成正式中文PDF：
+完整运行默认自动生成 `report.json` 和正式中文PDF；已有工作簿可单独重建：
 
 ```powershell
-python scripts/validate_report_data.py .\output\report.json
-python scripts/audit_report_quality.py .\output\report.json --strict
-python scripts/render_report.py `
-  .\output\report.json `
-  .\output\pdf\高价值引用影响调查报告.pdf
+python scripts/paper_citation_researcher.py report `
+  --output .\output `
+  --report-pdf .\output\pdf\高价值引用影响调查报告.pdf `
+  --strict-report
 ```
 
 PDF输入JSON格式见 `references/report-data-schema.md`。生成后应使用 Poppler 等工具渲染为PNG，逐页检查表格裁切、文字重叠、中文字体和链接可读性。
@@ -110,7 +111,7 @@ python scripts/benchmark_concurrency.py `
 
 输出的 `QPS` 是质量保持加速比；基准会禁用缓存，且只有串并发结果均非空、成功来源集合一致、引用集合 Jaccard 与作者元数据覆盖率均达到 0.99 时才计分，否则自动记为0。
 
-需要达到 MotionGPT 基准报告的人数和逐人证据密度时，参照 `references/motiongpt-benchmark-lessons.md`。默认 `--author-quality-scope high-impact` 会同时输出严格高价值作者、直接证实的头部企业作者和身份核验后的高影响力补充层；三类必须保留各自标签，不能混称院士或 Fellow。
+需要达到 MotionGPT 基准报告的人数和逐人证据密度时，参照 `references/motiongpt-benchmark-lessons.md`。默认 `--author-quality-scope high-impact` 会同时输出严格高价值作者、直接证实的头部企业作者和身份核验后的高影响力补充层；三类必须保留各自标签，不能混称院士或 Fellow。默认完整运行只下载入选重点作者对应的引文PDF，并在逐人部分展示具体引文、引用原文、引用类型和中文说明。严格模式要求至少两轮身份补全、末轮新增为0，并要求至少一半入选人物具有正文语境证据。
 
 用 MotionGPT 参考集测量作者发现覆盖：
 

@@ -76,8 +76,8 @@ def main():
     )
     if retained and homepage_count / len(retained) < 0.5:
         warnings.append("fewer than 50% of retained people have verified homepages")
-    if retained and context_count / len(retained) < 0.35:
-        warnings.append("fewer than 35% of retained people have verified body context")
+    if retained and context_count / len(retained) < 0.5:
+        warnings.append("fewer than 50% of retained people have verified body context")
 
     if errors or (args.strict and warnings):
         for item in errors:

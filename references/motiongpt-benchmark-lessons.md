@@ -19,6 +19,9 @@ Benchmark file: `MotionGPT_ Human Mot_2026年07月14日17时48分00秒.pdf`.
 4. Run targeted deep searches for each priority author: exact name plus affiliation, IEEE/ACM/AAAI Fellow, national academy/Royal Society/Academia Europaea, and personal or university homepage.
 5. For every retained author, keep the exact citing-paper title and, when a PDF is available, original citation context plus a conservative Chinese paraphrase.
 6. Measure coverage by unique retained people, retained citation records, homepage coverage, honor-evidence coverage, company-evidence coverage, and citation-context coverage.
+7. Use one person per detail block. Under that person, list every named citing paper separately; never merge several people into one prose item.
+8. Download retained high-value citing papers after author selection, then preserve the exact body passage and classify its role as method, background, baseline/comparison, or dataset.
+9. Present the original passage before the Chinese technical explanation. The explanation must describe what the citing paper says about the target contribution, not merely state that a citation exists.
 
 ## What not to copy
 
@@ -30,4 +33,4 @@ Benchmark file: `MotionGPT_ Human Mot_2026年07月14日17时48分00秒.pdf`.
 
 ## Quality target
 
-Match the benchmark's evidence density, not its unsupported certainty. A comparable result should have one author per row, exact citing-paper title, verified titles/honors, direct company-affiliation evidence, profile/homepage, confidence label, and citation context where available.
+Match the benchmark's evidence density, not its unsupported certainty. A comparable result should have one author per row, exact citing-paper title, verified titles/honors, direct company-affiliation evidence, profile/homepage, confidence label, and citation context where available. In strict mode, fewer than two enrichment passes, a nonzero final-pass yield, fewer than 50% of retained people with verified body context, or missing per-context role/original text/Chinese explanation fails the quality gate.

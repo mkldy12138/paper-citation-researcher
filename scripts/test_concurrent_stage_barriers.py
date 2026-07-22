@@ -234,3 +234,11 @@ same_name_candidates, _ = MODULE.collect_author_candidates_from_papers(same_name
 assert len(same_name_candidates) == 2
 assert {item["author_key"] for item in same_name_candidates} == {"s2:S2-LEI-1", "s2:S2-LEI-2"}
 print("OK same-name stable-ID disambiguation")
+
+motiongpt_aliases = MODULE.target_title_aliases({"title": "MotionGPT: Human Motion as a Foreign Language"})
+assert "MotionGPT" in motiongpt_aliases
+assert MODULE.classify_citation_role("We use MotionGPT as our base model.") == "method"
+assert MODULE.classify_citation_role("We compare against MotionGPT as a baseline.") == "baseline"
+assert MODULE.classify_citation_role("The dataset follows MotionGPT annotations.") == "dataset"
+assert MODULE.classify_citation_role("Recent work includes MotionGPT [12].") == "background"
+print("OK dynamic target aliases and citation-role classification")

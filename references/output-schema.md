@@ -125,6 +125,8 @@ Reliable in-body citation locations.
 - `match_type`: reliable cue type used to keep the context.
 - `confidence`: heuristic confidence score.
 - `context`: extracted in-body citation context.
+- `citation_role`: deterministic role classification: `method`, `background`, `baseline`, or `dataset`.
+- `assessment_type`: `positive_assessment` when affirmative language is present; otherwise the citation role.
 - `is_positive`: whether the context contains positive/affirmative language.
 - `reference_marker`, `reference_score`, `reference_evidence`, `reference_entry`: target-paper reference entry evidence used to validate the body location.
 

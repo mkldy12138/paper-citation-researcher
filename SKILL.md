@@ -25,6 +25,8 @@ Use this skill only for focused high-value citation research. Do not make a broa
 11. For AMiner-scale or exhaustive requests, read `references/quality-and-coverage-standard.md`, expand every citing author, complete at least two enrichment passes, and run the strict quality audit before rendering.
 12. For full runs, read `references/concurrency-model.md`. Use bounded Map-Barrier-Reduce concurrency: fan out independent sources/tasks, wait for the entire stage, merge deterministically, then start the dependent stage.
 13. When the user expects AMiner/MotionGPT-scale author coverage, read `references/motiongpt-benchmark-lessons.md`. Preserve structured citing-author institutions, run honor/company-targeted deep searches, and deliver a strict high-value layer plus a separately labeled high-impact supplement.
+14. In detailed-report mode, keep exactly one person in each evidence block. For every named citing paper, show the original body context first, then its role (`method`, `background`, `baseline`, or `dataset`) and a specific conservative Chinese technical explanation. A generic role sentence is only a draft and must be refined before final delivery.
+15. Treat the first generated PDF as a review artifact. A final detailed PDF requires at least two enrichment passes, zero newly verified people in the last pass, per-person citing-paper evidence, and rendered-page inspection.
 
 ## High-Value Reporting Rules
 
@@ -48,12 +50,10 @@ Run the full workflow:
 python scripts/paper_citation_researcher.py run --paper "Attention Is All You Need" --output ".\citation-output" --max-papers 1000 --browser edge --scholar-locale zh-CN --find-workers 4 --metadata-workers 12 --author-workers 8 --wiki-workers 4 --download-workers 8 --analyze-workers 4
 ```
 
-Generate the formal Chinese PDF after creating the verified report JSON:
+The default `run` command also creates `report.json` and `pdf/high-value-citation-report.pdf`. Rebuild a formal report from an existing workbook with:
 
 ```powershell
-python scripts/validate_report_data.py .\output\report.json
-python scripts/audit_report_quality.py .\output\report.json --strict
-python scripts/render_report.py .\output\report.json .\output\pdf\citation-impact-report.pdf
+python scripts/paper_citation_researcher.py report --output .\output --strict-report
 ```
 
 Render the PDF to images with Poppler (`pdftoppm -png`) or an equivalent renderer and inspect every page for clipped tables, overlaps, broken Chinese glyphs, and unreadable URLs. Do not deliver an uninspected PDF.
@@ -66,6 +66,7 @@ python scripts/paper_citation_researcher.py authors --output ".\out"
 python scripts/paper_citation_researcher.py download --output ".\out" --download-workers 4
 python scripts/paper_citation_researcher.py analyze --output ".\out"
 python scripts/paper_citation_researcher.py dashboard --output ".\out"
+python scripts/paper_citation_researcher.py report --output ".\out" --strict-report
 ```
 
 The primary tabular output is `citation_report.xlsx`. The script can read older output directories that still contain CSV files; after a successful workbook write, legacy table files are removed unless `--export-legacy-csv` is explicitly supplied.
@@ -112,6 +113,9 @@ Optional configuration:
 - `--wiki-workers`: defaults to `4`; controls parallel Wikipedia/Wikidata and homepage enrichment.
 - `--download-workers`: defaults to `8`; downloads distinct citing PDFs concurrently.
 - `--analyze-workers`: defaults to `4`; analyzes distinct local PDFs concurrently before ordered reduction.
+- `--download-scope`: full `run` defaults to `high-value`; after author selection it downloads only citing papers represented in the retained notable set. Use `all` only when complete full-text analysis is explicitly required.
+- `--formal-report` / `--no-formal-report`: defaults to enabled for full runs; generates validated JSON and a Chinese PDF after the workbook and dashboard.
+- `--strict-report`: fails report generation when discovery, saturation, homepage, or body-context evidence thresholds are incomplete.
 - `--author-top-n`: defaults to `100`; controls priority roster and biographical enrichment.
 - `--max-author-profiles`: defaults to `1000`; covers the complete citing-author pool for detailed investigations.
 - `--homepage-search-limit`: defaults to `250`; for expert-scope authors without a known profile homepage, searches for likely personal/school homepages and extracts profile evidence.
@@ -172,10 +176,11 @@ When the user asks what can be changed, explain only the relevant phase:
 - Author title/honor enrichment also follows the Google Scholar or Semantic Scholar homepage URL when present, including university/lab/personal pages. If no homepage URL is available, the expert-scope fallback uses a deep-search-style web search for likely personal/school profile pages (`--homepage-search-limit`, default 50), then validates that the page is the same person by cross-checking name, known affiliation, research interests, source context, and education/background evidence before accepting it. Deep-search pages must not be accepted on name alone: they need affiliation/research overlap, or an exact name plus education/background evidence on an academic profile URL. Unverified or same-name-only pages are rejected with `personal_homepage_rejection_reason` and are not shown as author homepage links. Verified evidence is shown in the dashboard as `personal_or_school_homepage`.
 - Deep search uses exact-name queries targeted at the citing-paper affiliation, IEEE/ACM/AAAI Fellow status, national academies/Royal Society/Academia Europaea, and university/personal profiles. Authoritative society or academy pages receive a ranking boost, but identity still requires cross-evidence.
 - OpenAlex institution evidence is retained per author and per citing paper. Major-company classification requires that structured authorship and company institution share the same citing record; supported companies include Google/DeepMind, NVIDIA, Microsoft, Meta, Amazon, Apple, Adobe, Intel, IBM, ByteDance/TikTok, Tencent, Alibaba, Huawei, Samsung, OpenAI, Waymo, Baidu, Kuaishou, and Megvii.
-- Wikipedia/Wikidata enrichment checks priority non-target authors and uses roster reverse-matching when a complete author list is available. Classify verified authors as `elite_award`, `academy_member`, `ieee_fellow`, `high_impact`, `other_notable`, or `unverified`. The default core table accepts `elite_award`, `academy_member`, and `ieee_fellow`; ordinary professors, editors, conference chairs, and general society members do not qualify. Preserve evidence and rejection reasons for auditability.
-- PDF downloading uses parallel workers by default (`--download-workers 4`).
+- Wikipedia/Wikidata enrichment checks priority non-target authors and uses roster reverse-matching when a complete author list is available. Classify verified authors as `elite_award`, `academy_member`, `ieee_fellow`, `major_company`, `high_impact`, `other_notable`, or `unverified`. The strict core accepts awards, academies, verified Fellows, and directly evidenced major-company authors. The default `high-impact` view adds a separately labeled metric-threshold supplement; ordinary professors, editors, conference chairs, and general society members do not qualify for the strict core. Preserve evidence and rejection reasons for auditability.
+- PDF downloading uses parallel workers by default (`--download-workers 8`). A full run uses `--download-scope high-value`, so the evidence-stage download set is formed only after retained-author selection.
 - PDF download only uses open/direct links, publisher metadata links, arXiv, or ACL Anthology. Do not use paywall bypasses.
 - Analysis first locates the target paper's reference entry in each PDF, then reports only reliable body locations: verified numeric citation markers tied to that reference entry, or explicit target-name mentions. It writes reliable location and coverage data into the workbook and automatically generates a self-contained HTML dashboard.
+- Citation contexts are classified as method, background, baseline/comparison, or dataset. Preserve the exact original context in the formal report; a positive label requires positive wording in that context.
 - The `dashboard` command regenerates the HTML dashboard from `citation_report.xlsx`. If author sheets are absent, the dashboard hides author-specific panels.
 
 ## Outputs
