@@ -114,7 +114,7 @@ Non-target author ranking. Target-paper authors are excluded from this sheet by 
 - `expert_rejection_reason`: reason a queried author did not enter `notable_citations`, such as `no_wikipedia_or_wikidata_match`, `low_name_confidence`, `no_academic_profile_hint`, `no_explicit_honor_or_role`, or `disambiguation_page`.
 - `is_notable`: `True` only when the match is a high-confidence scholar/person page with explicit evidence.
 - `notable_reason`: evidence copied into notable-scholar outputs.
-- `author_quality_tier`: `elite_award`, `academy_member`, `ieee_fellow`, `high_impact`, `other_notable`, or `unverified`.
+- `author_quality_tier`: `elite_award`, `academy_member`, `ieee_fellow`, `society_fellow`, `major_company`, `high_impact`, `other_notable`, or `unverified`. `society_fellow` covers independently verified ACM/AAAI/IAPR Fellows and must not be reported as IEEE Fellow.
 - `author_quality_reason`: the matched award/membership phrase or the metric threshold evidence.
 - `is_high_quality`: `True` for elite awards, academy membership, verified IEEE Fellow status, and metric-qualified high-impact authors. The default `high-value` scope includes only the first three honor-based classes.
 
@@ -134,6 +134,8 @@ Reliable in-body citation locations.
 - `assessment_type`: `positive_assessment` when affirmative language is present; otherwise the citation role.
 - `is_positive`: whether the context contains positive/affirmative language.
 - `reference_marker`, `reference_score`, `reference_evidence`, `reference_entry`: target-paper reference entry evidence used to validate the body location.
+
+For citing PDFs inspected outside the automatic analyzer, save `verified_citation_contexts.json` in the run output directory (or pass `report --verified-contexts PATH`). Use an object with `target_title` and a `contexts` list. Each row must include `citing_title`, `context`, `citation_role`, `confidence`, and an existing local `pdf_path`; include `page`, `assessment_type`, `is_positive`, and a source-specific `assessment_zh` when known. The report builder rejects a mismatched target title or a missing evidence PDF. This file may add inspected body context only; it must not create citing authors, citation relationships, or honor claims.
 
 ### `downloaded_papers`
 

@@ -23,6 +23,8 @@
 - 对带 DOI 的引文作者表默认进行 Crossref 校正；仅在题名、作者总数、作者顺序和其余合作者共同支持时修复硬冲突，并完整保留原始姓名、原始来源 ID、校正类型、证据链接和置信度。缩写、重音、空格、连字符等规范写法差异保留作者 ID；硬冲突校正自动进入 DBLP 精确姓名+机构消歧、官方主页/Biography、荣誉和画像核验队列。Semantic Scholar 姓名检索若没有严格等价结果则明确拒绝，不再取“最高引用的近似姓名”。
 - 保留 OpenAlex 的逐作者机构并与 Semantic Scholar 作者ID合并；同一引用记录中的 NVIDIA、Google/DeepMind、Microsoft、TikTok/ByteDance 等机构直接形成企业署名证据。
 - 对优先作者并发执行定向 Deep Search：姓名+机构、IEEE/ACM/AAAI Fellow、各国科学院/Royal Society，以及学校或个人主页。
+- 在排序截断前，将全部引文作者与 `references/verified-high-value-author-seeds.json` 中已由权威主页独立核验的院士/Fellow反向匹配；Semantic Scholar、Wikipedia 或 Wikidata 遇到429时仍保留这条证据链。名册只证明头衔，引用论文署名和目标引用仍须单独核验。
+- 已独立下载并逐页核对的引文PDF可将正文证据写入 `OUTPUT/verified_citation_contexts.json`；报告会校验目标标题和本地PDF存在性，并显示页码和证据路径。该文件只补正文语境，不能添加作者、引用关系或头衔。
 - 逐条核验院士、Fellow、奖项和企业归属，无法唯一对应时不纳入核心结果。
 - 自动生成 `citation_report.xlsx` 和可浏览的 HTML 调查面板，作为可审计的数据底稿。
 - 每次面向用户的正式调查都必须从经过验证的JSON生成中文PDF报告，包含总览表、逐人证据、企业作者、检索范围、限制和排除项；只有 Excel、HTML 或 JSON 时不算完成。
@@ -100,6 +102,8 @@ python scripts/paper_citation_researcher.py report `
   --report-pdf .\output\pdf\高价值引用影响调查报告.pdf `
   --strict-report
 ```
+
+若 `OUTPUT/verified_citation_contexts.json` 存在，`report` 会自动读取；也可用 `--verified-contexts <路径>` 显式指定。格式和约束见 `references/output-schema.md`。
 
 PDF输入JSON格式见 `references/report-data-schema.md`。生成后必须使用 Poppler 等工具渲染为PNG，逐页检查表格裁切、文字重叠、中文字体和链接可读性。最终答复必须直接给出PDF文件的绝对可点击路径，并同时说明页数和逐页检查结果；不得只交付 Excel、HTML、JSON、命令或生成说明。
 

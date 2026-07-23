@@ -20,6 +20,13 @@ def integer(value):
         return 0
 
 
+def optional_positive_integer(value):
+    if value is None or str(value).strip() == "":
+        return ""
+    parsed = integer(value)
+    return parsed if parsed > 0 else ""
+
+
 def number(value):
     try:
         return float(value or 0)
@@ -47,11 +54,66 @@ def split_values(value):
     return [item.strip() for item in re.split(r"\s*[|;]\s*", str(value or "")) if item.strip()]
 
 
-def read_sheet(workbook, name):
+def verified_display_name(author):
+    source_name = str(author.get("name") or "").strip()
+    profile_name = str(author.get("wikipedia_title") or "").strip()
+    if profile_name and sorted(norm(profile_name).split()) == sorted(norm(source_name).split()):
+        return profile_name
+    return source_name
+
+
+def read_report_sheets(workbook, names):
+    requested = list(names)
     try:
-        return pd.read_excel(workbook, sheet_name=name).fillna("")
+        frames = pd.read_excel(workbook, sheet_name=requested)
     except ValueError:
-        return pd.DataFrame()
+        available = pd.ExcelFile(workbook).sheet_names
+        present = [name for name in requested if name in available]
+        frames = pd.read_excel(workbook, sheet_name=present) if present else {}
+    return {
+        name: frames.get(name, pd.DataFrame()).fillna("")
+        for name in requested
+    }
+
+
+def read_verified_contexts(path, target_title):
+    if not path:
+        return []
+    context_path = Path(path)
+    if not context_path.is_file():
+        raise FileNotFoundError(f"Verified context file not found: {context_path}")
+    payload = json.loads(context_path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        declared_target = str(payload.get("target_title") or "").strip()
+        if declared_target and norm(declared_target) != norm(target_title):
+            raise ValueError(
+                "Verified context target does not match workbook target: "
+                f"{declared_target!r} != {target_title!r}"
+            )
+        rows = payload.get("contexts") or []
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        raise ValueError("Verified context JSON must be an object or a list")
+    required = {"citing_title", "context", "citation_role", "confidence", "pdf_path"}
+    cleaned = []
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            raise ValueError(f"Verified context row {index} is not an object")
+        missing = [field for field in required if not str(row.get(field) or "").strip()]
+        if missing:
+            raise ValueError(f"Verified context row {index} missing: {', '.join(missing)}")
+        pdf_path = Path(str(row["pdf_path"]))
+        if not pdf_path.is_file():
+            raise FileNotFoundError(f"Verified context PDF not found: {pdf_path}")
+        item = dict(row)
+        item["source_platforms"] = str(item.get("source_platforms") or "inspected citing-paper PDF")
+        item["match_type"] = str(item.get("match_type") or "manual_pdf_inspection")
+        item["assessment_type"] = str(item.get("assessment_type") or item.get("citation_role") or "")
+        item["is_positive"] = truthy(item.get("is_positive"))
+        item["verified_context_source"] = str(context_path)
+        cleaned.append(item)
+    return cleaned
 
 
 def note_name(key):
@@ -198,9 +260,11 @@ def citing_papers_for_author(author, paper_authors, papers_by_title, contexts_by
                 "url": paper_url,
                 "context": str(best.get("context") or ""),
                 "context_original": str(best.get("context_original") or best.get("context") or ""),
+                "page": str(best.get("page") or ""),
+                "evidence_pdf": str(best.get("pdf_path") or ""),
                 "citation_role": role,
                 "assessment_type": str(best.get("assessment_type") or role),
-                "assessment_zh": ROLE_ZH.get(role, ""),
+                "assessment_zh": str(best.get("assessment_zh") or ROLE_ZH.get(role, "")),
                 "positive_assessment": truthy(best.get("is_positive")),
                 "context_status": context_status,
             }
@@ -218,19 +282,73 @@ def claim_verdicts(has_homepage, has_context):
     }
 
 
+def dedupe_retained_people(rows, kind):
+    merged = []
+    by_identity = {}
+    for row in rows:
+        home = str(row.get("homepage") or "").strip().lower()
+        affiliation = str(row.get("affiliation") or row.get("raw_affiliation") or "")
+        category = str(row.get("honor") or row.get("company") or "")
+        identity_anchor = home or norm(affiliation)
+        key = (kind, norm(row.get("name")), norm(category), identity_anchor)
+        if key not in by_identity:
+            item = dict(row)
+            item["citing_papers"] = list(row.get("citing_papers") or [])
+            merged.append(item)
+            by_identity[key] = item
+            continue
+        current = by_identity[key]
+        paper_by_title = {norm(paper.get("title")): paper for paper in current.get("citing_papers") or []}
+        for paper in row.get("citing_papers") or []:
+            paper_key = norm(paper.get("title"))
+            previous = paper_by_title.get(paper_key)
+            if previous is None:
+                current["citing_papers"].append(paper)
+                paper_by_title[paper_key] = paper
+            elif previous.get("context_status") != "verified" and paper.get("context_status") == "verified":
+                previous.update(paper)
+        for evidence_field in ("honor_evidence", "affiliation_evidence"):
+            current[evidence_field] = list(
+                dict.fromkeys((current.get(evidence_field) or []) + (row.get(evidence_field) or []))
+            )
+        for metric_field in ("h_index", "personal_citation_count"):
+            available = [
+                optional_positive_integer(value)
+                for value in (current.get(metric_field), row.get(metric_field))
+                if optional_positive_integer(value) != ""
+            ]
+            current[metric_field] = max(available) if available else ""
+        if row.get("confidence") == "high":
+            current["confidence"] = "high"
+        current["claim_verdicts"] = {
+            verdict: (
+                "supported"
+                if "supported" in {str(value), str((row.get("claim_verdicts") or {}).get(verdict))}
+                else value
+            )
+            for verdict, value in (current.get("claim_verdicts") or {}).items()
+        }
+    return merged
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build formal citation-report JSON from citation_report.xlsx")
     parser.add_argument("--workbook", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--verified-contexts", default="")
     args = parser.parse_args()
 
     workbook = Path(args.workbook)
-    target = target_data(read_sheet(workbook, "target"))
-    papers = read_sheet(workbook, "papers")
-    paper_authors = read_sheet(workbook, "paper_authors")
-    authors = read_sheet(workbook, "authors")
-    contexts = read_sheet(workbook, "citation_locations")
-    notes_frame = read_sheet(workbook, "run_notes")
+    sheets = read_report_sheets(
+        workbook,
+        ("target", "papers", "paper_authors", "authors", "citation_locations", "run_notes"),
+    )
+    target = target_data(sheets["target"])
+    papers = sheets["papers"]
+    paper_authors = sheets["paper_authors"]
+    authors = sheets["authors"]
+    contexts = sheets["citation_locations"]
+    notes_frame = sheets["run_notes"]
     notes = {}
     for row in notes_frame.to_dict("records"):
         notes[note_name(row.get("key"))] = row.get("value", "")
@@ -239,11 +357,13 @@ def main():
     contexts_by_title = defaultdict(list)
     for row in contexts.to_dict("records"):
         contexts_by_title[norm(row.get("citing_title"))].append(row)
+    for row in read_verified_contexts(args.verified_contexts, target.get("title", "")):
+        contexts_by_title[norm(row.get("citing_title"))].append(row)
 
     scholars = []
     companies = []
     excluded = []
-    scholar_tiers = {"elite_award", "academy_member", "ieee_fellow", "high_impact"}
+    scholar_tiers = {"elite_award", "academy_member", "ieee_fellow", "society_fellow", "high_impact"}
     for author in authors.to_dict("records"):
         tier = str(author.get("author_quality_tier") or "unverified")
         author_papers = citing_papers_for_author(author, paper_authors, papers_by_title, contexts_by_title)
@@ -260,11 +380,11 @@ def main():
                     reason += "；未找到可核验主页"
                 scholars.append(
                     {
-                        "name": author.get("name", ""),
+                        "name": verified_display_name(author),
                         "honor": honor,
                         "affiliation": author.get("profile_affiliations") or author.get("source_affiliations") or "",
-                        "h_index": integer(author.get("semantic_scholar_h_index")),
-                        "personal_citation_count": integer(author.get("selected_citation_count")),
+                        "h_index": optional_positive_integer(author.get("semantic_scholar_h_index")),
+                        "personal_citation_count": optional_positive_integer(author.get("selected_citation_count")),
                         "homepage": home,
                         "confidence": "high" if author.get("personal_homepage_url") or author.get("wikipedia_url") else "medium",
                         "confidence_reason": reason,
@@ -286,7 +406,7 @@ def main():
             companies.append(
                 {
                     "company": company,
-                    "name": author.get("name", ""),
+                    "name": verified_display_name(author),
                     "raw_affiliation": author.get("source_affiliations") or author.get("profile_affiliations") or "",
                     "homepage": home,
                     "confidence": "high" if home else "medium",
@@ -296,6 +416,9 @@ def main():
                     "citing_papers": author_papers,
                 }
             )
+
+    scholars = dedupe_retained_people(scholars, "scholar")
+    companies = dedupe_retained_people(companies, "company")
 
     try:
         source_counts = json.loads(str(notes.get("find.platform_record_counts_json") or "{}"))

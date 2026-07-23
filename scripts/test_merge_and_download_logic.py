@@ -762,10 +762,42 @@ def main() -> None:
     assert module.classify_author_quality("recipient of the Turing Award", "high", 100, 10, True)[0] == "elite_award"
     assert module.classify_author_quality("Fellow of the Royal Society", "medium", 100, 10, True)[0] == "academy_member"
     assert module.classify_author_quality("IEEE Fellow", "high", 100, 10, True)[0] == "ieee_fellow"
-    assert module.classify_author_quality("ACM Fellow and professor", "high", 1000, 40, True)[0] == "other_notable"
+    assert module.classify_author_quality("ACM Fellow and professor", "high", 1000, 40, True)[0] == "society_fellow"
     assert module.classify_author_quality("verified profile", "high", 60000, 80, False)[0] == "high_impact"
     assert module.quality_scope_accepts("high_impact", "elite") is False
     assert module.quality_scope_accepts("ieee_fellow", "high-value") is True
+    assert module.quality_scope_accepts("society_fellow", "high-value") is True
+    roster = module.load_verified_high_value_roster()
+    seeded = module.verified_roster_profile_for_candidate(
+        {
+            "name": "Li Fei-Fei",
+            "semantic_author_id": "verified-source-id",
+            "source_affiliations": "Stanford University",
+        },
+        roster,
+    )
+    assert seeded["is_notable"] is True
+    assert "National Academy of Engineering" in seeded["honors_awards"]
+    ambiguous = module.verified_roster_profile_for_candidate(
+        {
+            "name": "Lei Zhang",
+            "semantic_author_id": "ambiguous-source-id",
+            "source_affiliations": "Unrelated University",
+        },
+        roster,
+    )
+    assert ambiguous == {}
+    corrected = module.verified_roster_profile_for_candidate(
+        {
+            "name": "Ming-Hsuan Yang",
+            "name_correction_types": "hard_source_conflict",
+            "name_correction_confidence": "high",
+            "source_affiliations": "University of California, Merced",
+        },
+        roster,
+    )
+    assert corrected["is_notable"] is True
+    assert "IEEE Fellow" in corrected["professional_memberships"]
     test_google_preferred_merge(module)
     test_url_alias_duplicate_merge(module)
     test_open_access_url_duplicate_merge(module)

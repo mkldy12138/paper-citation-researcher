@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "purpose": "Authoritative seed records for reverse-matching citing authors when profile APIs are unavailable. These records verify honors only; citing-paper authorship and target citation must still be verified per investigation.",
+  "authors": [
+    {
+      "name": "Fei-Fei Li",
+      "aliases": ["Li Fei-Fei"],
+      "affiliations": ["Stanford University"],
+      "academic_titles": "Sequoia Professor of Computer Science, Stanford University",
+      "honors_awards": "Member of the U.S. National Academy of Engineering; Member of the U.S. National Academy of Medicine; Member of the American Academy of Arts and Sciences",
+      "professional_memberships": "ACM Fellow",
+      "homepage_url": "https://engineering.stanford.edu/people/fei-fei-li",
+      "evidence_url": "https://engineering.stanford.edu/people/fei-fei-li",
+      "evidence_summary": "Stanford Engineering profile verifies her Stanford appointment, NAE and NAM membership, American Academy of Arts and Sciences membership, and ACM Fellow status."
+    },
+    {
+      "name": "Jitendra Malik",
+      "aliases": [],
+      "affiliations": ["University of California, Berkeley", "UC Berkeley"],
+      "academic_titles": "Arthur J. Chick Professor of Electrical Engineering and Computer Sciences, UC Berkeley",
+      "honors_awards": "Member of the U.S. National Academy of Sciences; Member of the U.S. National Academy of Engineering; Member of the American Academy of Arts and Sciences",
+      "professional_memberships": "IEEE Fellow; ACM Fellow",
+      "homepage_url": "https://www2.eecs.berkeley.edu/Faculty/Homepages/malik.html",
+      "evidence_url": "https://www2.eecs.berkeley.edu/Faculty/Homepages/malik.html",
+      "evidence_summary": "UC Berkeley EECS profile verifies his chair, NAS and NAE membership, American Academy of Arts and Sciences membership, and IEEE/ACM Fellow status."
+    },
+    {
+      "name": "Ming-Hsuan Yang",
+      "aliases": [],
+      "affiliations": ["University of California, Merced", "UC Merced"],
+      "academic_titles": "Professor of Electrical Engineering and Computer Science, University of California, Merced",
+      "honors_awards": "",
+      "professional_memberships": "IEEE Fellow; ACM Fellow; AAAI Fellow",
+      "homepage_url": "https://faculty.ucmerced.edu/mhyang/",
+      "evidence_url": "https://faculty.ucmerced.edu/mhyang/bio.html",
+      "evidence_summary": "UC Merced biography verifies his professorship and IEEE, ACM, and AAAI Fellow status.",
+      "require_affiliation_match": true
+    },
+    {
+      "name": "Richard Hartley",
+      "aliases": [],
+      "affiliations": ["Australian National University", "ANU"],
+      "academic_titles": "Professor, Australian National University",
+      "honors_awards": "Fellow of the Australian Academy of Science",
+      "professional_memberships": "",
+      "homepage_url": "https://comp.anu.edu.au/people/richard-hartley/",
+      "evidence_url": "https://www.science.org.au/profile/richard-hartley",
+      "evidence_summary": "Australian Academy of Science fellow profile verifies Richard Hartley's academy fellowship and links his ANU institutional profile."
+    },
+    {
+      "name": "Dacheng Tao",
+      "aliases": [],
+      "affiliations": ["Nanyang Technological University", "NTU Singapore"],
+      "academic_titles": "Distinguished University Professor, Nanyang Technological University",
+      "honors_awards": "Fellow of the Australian Academy of Science",
+      "professional_memberships": "IEEE Fellow; ACM Fellow; AAAS Fellow",
+      "homepage_url": "https://dr.ntu.edu.sg/entities/person/Tao-Dacheng",
+      "evidence_url": "https://dr.ntu.edu.sg/entities/person/Tao-Dacheng",
+      "evidence_summary": "NTU academic profile verifies his NTU appointment and fellowship of the Australian Academy of Science, AAAS, ACM, and IEEE."
+    },
+    {
+      "name": "Lei Zhang",
+      "aliases": [],
+      "affiliations": ["Hong Kong Polytechnic University", "PolyU"],
+      "academic_titles": "Chair Professor, Department of Computing, Hong Kong Polytechnic University",
+      "honors_awards": "",
+      "professional_memberships": "IEEE Fellow",
+      "homepage_url": "https://www4.comp.polyu.edu.hk/~cslzhang/",
+      "evidence_url": "https://www4.comp.polyu.edu.hk/~cslzhang/",
+      "evidence_summary": "Hong Kong Polytechnic University-hosted profile verifies his chair professorship and IEEE Fellow status.",
+      "require_affiliation_match": true
+    },
+    {
+      "name": "Shuicheng Yan",
+      "aliases": ["Shuicheng YAN"],
+      "affiliations": ["National University of Singapore", "NUS"],
+      "academic_titles": "Distinguished Professor (Practice), School of Computing, National University of Singapore",
+      "honors_awards": "Fellow of the Singapore Academy of Engineering",
+      "professional_memberships": "AAAI Fellow; ACM Fellow; IEEE Fellow; IAPR Fellow",
+      "homepage_url": "https://www.comp.nus.edu.sg/cs/people/yansc/",
+      "evidence_url": "https://www.comp.nus.edu.sg/cs/people/yansc/",
+      "evidence_summary": "NUS profile verifies his appointment and Singapore Academy of Engineering, AAAI, ACM, IEEE, and IAPR fellowships."
+    },
+    {
+      "name": "Mubarak Shah",
+      "aliases": [],
+      "affiliations": ["University of Central Florida", "UCF"],
+      "academic_titles": "Trustee Chair Professor and founding director, Center for Research in Computer Vision, University of Central Florida",
+      "honors_awards": "Fellow of the National Academy of Inventors",
+      "professional_memberships": "ACM Fellow; IEEE Fellow; AAAS Fellow; IAPR Fellow; SPIE Fellow",
+      "homepage_url": "https://www.crcv.ucf.edu/person/mubarak-shah/",
+      "evidence_url": "https://www.crcv.ucf.edu/person/mubarak-shah/",
+      "evidence_summary": "UCF Center for Research in Computer Vision profile verifies his chair, founding-director role, and NAI, IEEE, AAAS, IAPR, and SPIE fellowships."
+    },
+    {
+      "name": "Xuelong Li",
+      "aliases": ["李学龙"],
+      "affiliations": ["TeleAI", "China Telecom", "Northwestern Polytechnical University"],
+      "academic_titles": "Artificial intelligence researcher",
+      "honors_awards": "",
+      "professional_memberships": "ACM Fellow",
+      "homepage_url": "https://awards.acm.org/award-recipients/li_3165359",
+      "evidence_url": "https://awards.acm.org/award-recipients/li_3165359",
+      "evidence_summary": "ACM award-recipient profile verifies Xuelong Li's ACM Fellow status."
+    },
+    {
+      "name": "Daniel Cohen-Or",
+      "aliases": [],
+      "affiliations": ["Tel Aviv University"],
+      "academic_titles": "Professor of Computer Science, Tel Aviv University",
+      "honors_awards": "",
+      "professional_memberships": "ACM Fellow",
+      "homepage_url": "https://danielcohenor.com/",
+      "evidence_url": "https://awards.acm.org/award-recipients/cohen-or_8339869",
+      "evidence_summary": "ACM award-recipient profile verifies Daniel Cohen-Or's ACM Fellow status; his personal profile verifies his Tel Aviv University professorship."
+    },
+    {
+      "name": "Yi Yang",
+      "aliases": [],
+      "affiliations": ["Zhejiang University"],
+      "academic_titles": "Qiushi Chair Professor and National Distinguished Expert, Zhejiang University",
+      "honors_awards": "",
+      "professional_memberships": "IEEE Fellow; IAPR Fellow",
+      "homepage_url": "http://www.en.cs.zju.edu.cn/2025/1209/c55704a3117300/page.htm",
+      "evidence_url": "http://www.en.cs.zju.edu.cn/2025/1209/c55704a3117300/page.htm",
+      "evidence_summary": "Zhejiang University announcement verifies Yi Yang's appointment and IEEE/IAPR Fellow status.",
+      "require_affiliation_match": true
+    }
+  ]
+}

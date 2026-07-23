@@ -14,6 +14,29 @@ with tempfile.TemporaryDirectory() as temp_dir:
     root = Path(temp_dir)
     workbook = root / "citation_report.xlsx"
     report_json = root / "report.json"
+    evidence_pdf = root / "inspected-citing-paper.pdf"
+    evidence_pdf.write_bytes(b"%PDF-1.4\n% test fixture\n")
+    verified_contexts = root / "verified_citation_contexts.json"
+    verified_contexts.write_text(
+        json.dumps(
+            {
+                "target_title": "Target Paper",
+                "contexts": [
+                    {
+                        "citing_title": "A Verified Citing Paper",
+                        "context": "The inspected PDF explicitly adopts the Target Paper method.",
+                        "citation_role": "method",
+                        "assessment_type": "positive_assessment",
+                        "is_positive": True,
+                        "confidence": 0.99,
+                        "page": 3,
+                        "pdf_path": str(evidence_pdf),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
         pd.DataFrame(
             [
@@ -81,7 +104,16 @@ with tempfile.TemporaryDirectory() as temp_dir:
         ).to_excel(writer, sheet_name="run_notes", index=False)
 
     subprocess.run(
-        [sys.executable, str(SCRIPTS / "build_report_data.py"), "--workbook", str(workbook), "--output", str(report_json)],
+        [
+            sys.executable,
+            str(SCRIPTS / "build_report_data.py"),
+            "--workbook",
+            str(workbook),
+            "--output",
+            str(report_json),
+            "--verified-contexts",
+            str(verified_contexts),
+        ],
         check=True,
     )
     subprocess.run([sys.executable, str(SCRIPTS / "validate_report_data.py"), str(report_json)], check=True)
@@ -90,7 +122,9 @@ with tempfile.TemporaryDirectory() as temp_dir:
     assert len(report["companies"]) == 1
     evidence = report["scholars"][0]["citing_papers"][0]
     assert evidence["title"] == "A Verified Citing Paper"
-    assert evidence["context_original"].startswith("We build on")
+    assert evidence["context_original"].startswith("The inspected PDF")
+    assert evidence["page"] == "3"
+    assert evidence["evidence_pdf"] == str(evidence_pdf)
     assert evidence["citation_role"] == "method"
     assert evidence["assessment_zh"]
     assert evidence["positive_assessment"] is True

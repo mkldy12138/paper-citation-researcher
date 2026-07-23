@@ -4419,7 +4419,8 @@ ACADEMY_MEMBER_RE = re.compile(
     r"member of the Chinese Academy of Sciences|member of the Chinese Academy of Engineering|"
     r"Chinese Academy of Sciences academician|Chinese Academy of Engineering academician|"
     r"Academician of (?:the )?[A-Z][A-Za-z .'-]+ Academy|Academia Sinica academician|"
-    r"member of Academia Europaea)\b",
+    r"member of Academia Europaea|Fellow of (?:the )?Australian Academy of Science|"
+    r"Fellow of (?:the )?Singapore Academy of Engineering)\b",
     re.I,
 )
 
@@ -4427,6 +4428,7 @@ QUALITY_TIER_ORDER = {
     "elite_award": 4,
     "academy_member": 3,
     "ieee_fellow": 2,
+    "society_fellow": 2,
     "major_company": 2,
     "high_impact": 2,
     "other_notable": 1,
@@ -4461,6 +4463,9 @@ def classify_author_quality(
         match = re.search(r"\bIEEE Fellow\b", evidence or "", re.I)
         if match:
             return "ieee_fellow", match.group(0), True
+        match = re.search(r"\b(?:ACM|AAAI|IAPR) Fellow\b", evidence or "", re.I)
+        if match:
+            return "society_fellow", match.group(0), True
         if company_affiliation:
             return "major_company", f"structured citing-paper affiliation: {company_affiliation}", True
     citations = parse_int(selected_citations)
@@ -4474,11 +4479,11 @@ def classify_author_quality(
 
 def quality_scope_accepts(tier: str, scope: str) -> bool:
     if scope == "high-value":
-        return tier in {"elite_award", "academy_member", "ieee_fellow", "major_company"}
+        return tier in {"elite_award", "academy_member", "ieee_fellow", "society_fellow", "major_company"}
     if scope == "elite":
         return tier in {"elite_award", "academy_member"}
     if scope == "high-impact":
-        return tier in {"elite_award", "academy_member", "ieee_fellow", "major_company", "high_impact"}
+        return tier in {"elite_award", "academy_member", "ieee_fellow", "society_fellow", "major_company", "high_impact"}
     return tier != "unverified"
 
 ACADEMIC_HINT_RE = re.compile(
@@ -5073,6 +5078,172 @@ def affiliation_identity_score(source_affiliations: str, candidate_affiliations:
         for source in source_parts
         for candidate in candidate_affiliations
     )
+
+
+AFFILIATION_GENERIC_TOKENS = {
+    "the",
+    "of",
+    "and",
+    "at",
+    "university",
+    "college",
+    "school",
+    "department",
+    "faculty",
+    "institute",
+    "laboratory",
+    "lab",
+    "research",
+}
+
+
+def distinctive_affiliation_match(source_affiliations: str, candidate_affiliations: Sequence[str]) -> bool:
+    source_tokens = set(normalize_text(source_affiliations).split())
+    if not source_tokens:
+        return False
+    for affiliation in candidate_affiliations:
+        candidate_tokens = set(normalize_text(affiliation).split())
+        distinctive = candidate_tokens - AFFILIATION_GENERIC_TOKENS
+        if not distinctive:
+            continue
+        # Require all identifying tokens from at least one authoritative alias.
+        # Generic words such as "University" never establish a homonym match.
+        if distinctive.issubset(source_tokens):
+            return True
+    return False
+
+
+VERIFIED_HIGH_VALUE_ROSTER = (
+    Path(__file__).resolve().parent.parent
+    / "references"
+    / "verified-high-value-author-seeds.json"
+)
+
+
+def load_verified_high_value_roster(path: Path = VERIFIED_HIGH_VALUE_ROSTER) -> List[Dict[str, Any]]:
+    payload = load_cache(path)
+    rows = payload.get("authors") if isinstance(payload, dict) else []
+    return [row for row in (rows or []) if isinstance(row, dict) and row.get("name")]
+
+
+def verified_roster_profile_for_candidate(
+    candidate: Dict[str, Any],
+    roster: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    candidate_name = str(candidate.get("name") or "").strip()
+    hard_correction_anchor = bool(
+        has_hard_name_correction(candidate)
+        and str(candidate.get("name_correction_confidence") or "").lower() in {"high", "verified"}
+        and str(candidate.get("source_affiliations") or "").strip()
+    )
+    has_stable_identity_anchor = bool(
+        candidate.get("semantic_author_id")
+        or candidate.get("openalex_author_id")
+        or str(candidate.get("identity_resolution_confidence") or "").lower() in {"high", "verified"}
+        or hard_correction_anchor
+    )
+    if not candidate_name or not has_stable_identity_anchor:
+        return {}
+    for record in roster:
+        roster_names = [record.get("name", ""), *(record.get("aliases") or [])]
+        if not any(strict_author_name_equivalent(candidate_name, name) for name in roster_names if name):
+            continue
+        candidate_affiliations = " | ".join(
+            str(candidate.get(field) or "").strip()
+            for field in (
+                "source_affiliations",
+                "semantic_scholar_affiliations",
+                "google_scholar_affiliation",
+            )
+            if candidate.get(field)
+        )
+        roster_affiliations = [str(value) for value in record.get("affiliations") or [] if value]
+        affiliation_score = affiliation_identity_score(candidate_affiliations, roster_affiliations)
+        if record.get("require_affiliation_match") and not distinctive_affiliation_match(
+            candidate_affiliations,
+            roster_affiliations,
+        ):
+            continue
+        evidence_url = str(record.get("evidence_url") or record.get("homepage_url") or "")
+        homepage_url = str(record.get("homepage_url") or evidence_url)
+        evidence_summary = str(record.get("evidence_summary") or "")
+        affiliations = " | ".join(roster_affiliations)
+        return {
+            "title": str(record.get("name") or candidate_name),
+            "url": evidence_url,
+            "summary": evidence_summary,
+            "evidence": evidence_summary,
+            "academic_titles": str(record.get("academic_titles") or ""),
+            "honors_awards": str(record.get("honors_awards") or ""),
+            "professional_memberships": str(record.get("professional_memberships") or ""),
+            "leadership_roles": str(record.get("leadership_roles") or ""),
+            "profile_affiliations": affiliations,
+            "profile_evidence_sources": f"verified_high_value_roster | {evidence_url}",
+            "notability_confidence": "high",
+            "is_notable": True,
+            "notable_reason": evidence_summary,
+            "expert_query_status": "notable",
+            "expert_rejection_reason": "",
+            "roster_identity_affiliation_score": round(affiliation_score, 3),
+            "homepage_profile": {
+                "homepage_url": homepage_url,
+                "homepage_summary": evidence_summary,
+                "homepage_evidence": evidence_summary,
+                "homepage_identity_status": "verified",
+                "homepage_identity_confidence": "high",
+                "homepage_identity_evidence": (
+                    f"Exact roster-name match with stable citing-author identity; "
+                    f"affiliation overlap={affiliation_score:.3f}; source={evidence_url}"
+                ),
+                "homepage_query_status": "verified_roster",
+                "academic_titles": str(record.get("academic_titles") or ""),
+                "honors_awards": str(record.get("honors_awards") or ""),
+                "professional_memberships": str(record.get("professional_memberships") or ""),
+                "leadership_roles": str(record.get("leadership_roles") or ""),
+                "is_notable": True,
+                "notable_reason": evidence_summary,
+                "enrichment_version": PROFILE_ENRICHMENT_VERSION,
+            },
+        }
+    return {}
+
+
+def merge_author_profile_evidence(primary: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
+    if not fallback:
+        return dict(primary or {})
+    merged = dict(primary or {})
+    for field in (
+        "title",
+        "url",
+        "summary",
+        "evidence",
+        "academic_titles",
+        "honors_awards",
+        "professional_memberships",
+        "leadership_roles",
+        "profile_affiliations",
+        "profile_evidence_sources",
+        "notable_reason",
+    ):
+        merged[field] = merge_evidence_field(merged.get(field, ""), fallback.get(field, ""))
+    merged["is_notable"] = bool(merged.get("is_notable") or fallback.get("is_notable"))
+    if fallback.get("notability_confidence") == "high":
+        merged["notability_confidence"] = "high"
+    merged["expert_query_status"] = "notable"
+    merged["expert_rejection_reason"] = ""
+    merged["roster_identity_affiliation_score"] = fallback.get("roster_identity_affiliation_score", "")
+    homepage = dict(merged.get("homepage_profile") or {})
+    fallback_homepage = fallback.get("homepage_profile") or {}
+    for key, value in fallback_homepage.items():
+        if key in {"academic_titles", "honors_awards", "professional_memberships", "leadership_roles", "homepage_evidence"}:
+            homepage[key] = merge_evidence_field(homepage.get(key, ""), value)
+        elif value and not homepage.get(key):
+            homepage[key] = value
+    if fallback_homepage.get("homepage_identity_status") == "verified":
+        homepage["homepage_identity_status"] = "verified"
+        homepage["homepage_identity_confidence"] = "high"
+    merged["homepage_profile"] = homepage
+    return merged
 
 
 def windows_web_text_fallback(url: str, timeout: int = 25) -> str:
@@ -5870,6 +6041,7 @@ def author_report_row(candidate: Dict[str, Any], wiki: Dict[str, Any]) -> Dict[s
                 str(candidate.get("source_affiliations") or "").strip(),
                 str(candidate.get("semantic_scholar_affiliations") or "").strip(),
                 str(candidate.get("google_scholar_affiliation") or "").strip(),
+                str(wiki.get("profile_affiliations") or "").strip(),
             ]
             if part
         )
@@ -6527,6 +6699,26 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     target_keys: List[str] = []
     seen_target_keys: set[str] = set()
     by_key = {candidate["author_key"]: candidate for candidate in non_target_enriched}
+    verified_roster = load_verified_high_value_roster()
+    roster_by_key: Dict[str, Dict[str, Any]] = {}
+    for candidate in non_target_enriched:
+        roster_profile = verified_roster_profile_for_candidate(candidate, verified_roster)
+        if not roster_profile:
+            continue
+        key = candidate["author_key"]
+        roster_by_key[key] = roster_profile
+        candidate["identity_resolution_sources"] = merge_evidence_field(
+            candidate.get("identity_resolution_sources", ""),
+            "verified high-value roster and official profile",
+        )
+        candidate["identity_resolution_evidence"] = merge_evidence_field(
+            candidate.get("identity_resolution_evidence", ""),
+            roster_profile.get("notable_reason", ""),
+        )
+        candidate["identity_resolution_confidence"] = "high"
+        roster_homepage = (roster_profile.get("homepage_profile") or {}).get("homepage_url", "")
+        if roster_homepage:
+            candidate["personal_homepage_url"] = roster_homepage
     for candidate in non_target_enriched:
         if not has_hard_name_correction(candidate):
             continue
@@ -6534,6 +6726,15 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
         if key not in seen_target_keys:
             target_keys.append(key)
             seen_target_keys.add(key)
+    for key in roster_by_key:
+        if key not in seen_target_keys:
+            target_keys.append(key)
+            seen_target_keys.add(key)
+    # Hard-corrected identities and independently verified roster matches are
+    # evidence-bearing results, not optional profile-query candidates. Keep all
+    # of them even when the external enrichment budget is smaller.
+    mandatory_target_count = len(target_keys)
+    selection_limit = max(expert_rank_limit, mandatory_target_count)
     breadth_budget = min(expert_rank_limit, max(1, expert_rank_limit // 3)) if expert_rank_limit else 0
     for key in top_paper_author_keys[:breadth_budget]:
         if key in by_key and key not in seen_target_keys:
@@ -6544,9 +6745,9 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
         if key not in seen_target_keys:
             target_keys.append(key)
             seen_target_keys.add(key)
-        if len(target_keys) >= expert_rank_limit:
+        if len(target_keys) >= selection_limit:
             break
-    target_keys = target_keys[:expert_rank_limit]
+    target_keys = target_keys[:selection_limit]
     wiki_targets = [by_key[key] for key in target_keys if key in by_key]
     selected_wiki_keys = {candidate["author_key"] for candidate in wiki_targets}
     for candidate in non_target_enriched:
@@ -6554,7 +6755,8 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     wiki_jobs = [
         (candidate["author_key"], candidate["name"])
         for candidate in wiki_targets
-        if (
+        if candidate["author_key"] not in roster_by_key
+        and (
             wiki_cache.get(candidate["author_key"], {}).get("enrichment_version") != PROFILE_ENRICHMENT_VERSION
             or wiki_cache.get(candidate["author_key"], {}).get("expert_query_status") == "wiki_api_error"
         )
@@ -6605,6 +6807,8 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     homepage_jobs = []
     for candidate in wiki_targets:
         key = candidate["author_key"]
+        if key in roster_by_key:
+            continue
         homepage_url = homepage_url_for_author(candidate)
         source_context = "direct_homepage"
         if homepage_url and plausible_personal_homepage_url(candidate.get("google_scholar_homepage_url", "")) == homepage_url:
@@ -6658,6 +6862,8 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
         if len(homepage_search_jobs) >= homepage_search_limit:
             break
         key = candidate["author_key"]
+        if key in roster_by_key:
+            continue
         homepage_url = homepage_url_for_author(candidate)
         cached_homepage = wiki_cache.get(key, {}).get("homepage_profile", {})
         cached_status = str(cached_homepage.get("homepage_query_status") or "")
@@ -6707,7 +6913,10 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
                     print(f"Deep-search author homepages fetched: {completed}/{len(homepage_search_jobs)}")
     for candidate in wiki_targets:
         key = candidate["author_key"]
-        wiki_by_key[key] = wiki_cache.get(key, {})
+        wiki_by_key[key] = merge_author_profile_evidence(
+            wiki_cache.get(key, {}),
+            roster_by_key.get(key, {}),
+        )
     for candidate in non_target_enriched:
         author_rows.append(author_report_row(candidate, wiki_by_key.get(candidate["author_key"], {})))
     author_report_by_key = {row["author_key"]: row for row in author_rows}
@@ -7799,17 +8008,21 @@ def cmd_report(args: argparse.Namespace) -> Path:
     )
     if not workbook.is_file():
         raise RuntimeError(f"Citation workbook not found: {workbook}")
-    subprocess.run(
-        [
-            sys.executable,
-            str(scripts_dir / "build_report_data.py"),
-            "--workbook",
-            str(workbook),
-            "--output",
-            str(report_json),
-        ],
-        check=True,
+    report_data_command = [
+        sys.executable,
+        str(scripts_dir / "build_report_data.py"),
+        "--workbook",
+        str(workbook),
+        "--output",
+        str(report_json),
+    ]
+    verified_contexts = Path(
+        getattr(args, "verified_contexts", "")
+        or output / "verified_citation_contexts.json"
     )
+    if verified_contexts.is_file():
+        report_data_command.extend(["--verified-contexts", str(verified_contexts)])
+    subprocess.run(report_data_command, check=True)
     subprocess.run(
         [sys.executable, str(scripts_dir / "validate_report_data.py"), str(report_json)],
         check=True,
@@ -7889,6 +8102,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 output=args.output,
                 report_json=args.report_json,
                 report_pdf=args.report_pdf,
+                verified_contexts=args.verified_contexts,
                 strict_report=args.strict_report,
             )
         )
@@ -7988,6 +8202,7 @@ def build_parser() -> argparse.ArgumentParser:
     report_p.add_argument("--output", required=True, help="Output directory containing citation_report.xlsx")
     report_p.add_argument("--report-json", default="", help="Optional report JSON path (default: OUTPUT/report.json)")
     report_p.add_argument("--report-pdf", default="", help="Optional PDF path (default: OUTPUT/pdf/high-value-citation-report.pdf)")
+    report_p.add_argument("--verified-contexts", default="", help="Optional inspected-PDF context JSON (default: OUTPUT/verified_citation_contexts.json when present)")
     report_p.add_argument("--strict-report", action="store_true", help="Fail if high-coverage quality thresholds are not met")
     report_p.set_defaults(func=cmd_report)
 
@@ -8002,6 +8217,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--formal-report", action=argparse.BooleanOptionalAction, default=True, help="Build validated report.json and Chinese PDF after analysis (default: enabled)")
     run_p.add_argument("--report-json", default="", help="Optional report JSON path (default: OUTPUT/report.json)")
     run_p.add_argument("--report-pdf", default="", help="Optional PDF path (default: OUTPUT/pdf/high-value-citation-report.pdf)")
+    run_p.add_argument("--verified-contexts", default="", help="Optional inspected-PDF context JSON (default: OUTPUT/verified_citation_contexts.json when present)")
     run_p.add_argument("--strict-report", action="store_true", help="Fail the run when high-coverage quality thresholds are not met")
     run_p.add_argument("--author-top-n", type=int, default=100, help="Priority authors to enrich with roster and biographical evidence (default: 100)")
     run_p.add_argument("--max-author-profiles", type=int, default=1000, help="Maximum author profiles to query across Semantic Scholar and Google Scholar (default: 1000)")

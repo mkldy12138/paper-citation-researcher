@@ -128,10 +128,18 @@ def build(data, output):
                 if paper_metrics:
                     block.append(Paragraph(f"<b>引文指标：</b>{esc('；'.join(paper_metrics))}", body))
                 block.append(Paragraph(f"<b>论文链接：</b>{esc(p.get('url'))}", small))
+                if p.get("evidence_pdf"):
+                    location = f"第 {p.get('page')} 页" if p.get("page") else "页码未记录"
+                    block.append(Paragraph(f"<b>正文证据：</b>{esc(location)}；{esc(p.get('evidence_pdf'))}", small))
                 status = {"verified":"正文引文已核验","reference-list-only":"仅参考文献表已核验","not-accessible":"全文未获取"}[p["context_status"]]
                 if p["context_status"] == "verified":
                     role = {"method":"方法引用","background":"背景/相关工作引用","baseline":"基线/比较引用","dataset":"数据集引用"}.get(p.get("citation_role"), "未分类")
-                    sentiment = "正面技术表述" if p.get("positive_assessment") else "中性引用"
+                    if p.get("positive_assessment"):
+                        sentiment = "正面技术表述"
+                    elif "critical" in str(p.get("assessment_type") or ""):
+                        sentiment = "批评性比较"
+                    else:
+                        sentiment = "中性引用"
                     block.append(Paragraph(f"<b>证据状态：</b>{status}；{role}；{sentiment}", body))
                 else:
                     block.append(Paragraph(f"<b>证据状态：</b>{status}", body))
