@@ -1,6 +1,6 @@
 ---
 name: paper-citation-researcher
-description: Investigate high-value citations to one or more academic papers and generate evidence-backed Excel, HTML, and Chinese PDF reports. Focus on Turing Award and other elite-prize recipients, academy members, Royal Society Fellows, verified IEEE Fellows, positive technical assessments, and authors affiliated with major international technology companies. Use when Codex must merge Google Scholar/Semantic Scholar/OpenAlex evidence with user-provided citation PDFs or Markdown, resolve names conservatively, deliver one detailed worksheet per target paper, or produce a polished high-value citation impact PDF.
+description: Investigate high-value citations to one or more academic papers and deliver an evidence-backed Chinese PDF report, with Excel and HTML retained as supporting audit artifacts. Focus on Turing Award and other elite-prize recipients, academy members, Royal Society Fellows, verified IEEE Fellows, positive technical assessments, and authors affiliated with major international technology companies. Use when Codex must merge Google Scholar/Semantic Scholar/OpenAlex evidence with user-provided citation PDFs or Markdown, resolve names conservatively, deliver one detailed worksheet per target paper, or produce a polished high-value citation impact PDF.
 ---
 
 # Paper Citation Researcher
@@ -21,12 +21,13 @@ Use this skill only for focused high-value citation research. Do not make a broa
 7. Report the exact citing-paper title for every retained person or company. Include evidence URLs/local paths, author ID when available, affiliation, honor, and a confidence or identity note. Add a `homepage/profile details` field using an identity-verified personal, university, organization, Google Scholar, Semantic Scholar, OpenAlex, or authoritative biographical page; leave it blank when no verified URL exists.
 8. For multiple targets, write one worksheet per target paper plus a short overview and an unmatched-files worksheet. Do not place all target details into one combined sheet.
 9. Do not download and analyze every citing PDF by default. Download only retained high-value citing papers when body-context evidence is requested or needed to resolve ambiguity.
-10. When a formal Chinese PDF is requested, convert the verified retained records to `references/report-data-schema.md`, validate the JSON, render the PDF, then inspect rendered pages before delivery.
+10. For every normal user-facing investigation, convert the verified retained records to `references/report-data-schema.md`, validate the JSON, and render a formal Chinese PDF. Excel and HTML are supporting audit artifacts, not substitutes for the PDF. A request is not complete while only `citation_report.xlsx`, `citation_dashboard.html`, or `report.json` exists.
 11. For AMiner-scale or exhaustive requests, read `references/quality-and-coverage-standard.md`, expand every citing author, complete at least two enrichment passes, and run the strict quality audit before rendering.
 12. For full runs, read `references/concurrency-model.md`. Use bounded Map-Barrier-Reduce concurrency: fan out independent sources/tasks, wait for the entire stage, merge deterministically, then start the dependent stage.
 13. When the user expects AMiner/MotionGPT-scale author coverage, read `references/motiongpt-benchmark-lessons.md`. Preserve structured citing-author institutions, run honor/company-targeted deep searches, and deliver a strict high-value layer plus a separately labeled high-impact supplement.
 14. In detailed-report mode, keep exactly one person in each evidence block. For every named citing paper, show the original body context first, then its role (`method`, `background`, `baseline`, or `dataset`) and a specific conservative Chinese technical explanation. A generic role sentence is only a draft and must be refined before final delivery.
 15. Treat the first generated PDF as a review artifact. A final detailed PDF requires at least two enrichment passes, zero newly verified people in the last pass, per-person citing-paper evidence, and rendered-page inspection.
+16. Deliver the final PDF file directly in the response using its absolute clickable path. Do not finish with commands, source files, Excel, HTML, or a description of how the user could generate it. Report the page count and visual-QA result alongside the link.
 
 ## High-Value Reporting Rules
 
@@ -69,7 +70,7 @@ python scripts/paper_citation_researcher.py dashboard --output ".\out"
 python scripts/paper_citation_researcher.py report --output ".\out" --strict-report
 ```
 
-The primary tabular output is `citation_report.xlsx`. The script can read older output directories that still contain CSV files; after a successful workbook write, legacy table files are removed unless `--export-legacy-csv` is explicitly supplied.
+The required user-facing output is the inspected Chinese PDF. The primary supporting tabular artifact is `citation_report.xlsx`. The script can read older output directories that still contain CSV files; after a successful workbook write, legacy table files are removed unless `--export-legacy-csv` is explicitly supplied.
 
 ## Initial Setup
 
@@ -191,13 +192,14 @@ When the user asks what can be changed, explain only the relevant phase:
 
 The output directory contains:
 
+- `pdf/high-value-citation-report.pdf` (or the path supplied with `--report-pdf`): required final user-facing report. Always render every page to images and inspect it before delivery.
 - `citation_report.xlsx`: consolidated workbook with all table data.
 - `citation_dashboard.html`: self-contained frontend dashboard with summary metrics, data-source status, source/download/coverage charts, researched citing-paper metadata table, highest-cited non-target author per paper with profile/homepage links, author impact ranking, author title/honor evidence table with Google Scholar/Semantic Scholar/personal homepage links and rejection diagnostics, notable-scholar citing-paper table when available, and reliable citation-location table.
 - `author_profile_cache.json`: cached Google Scholar and Semantic Scholar author profile lookups.
 - `crossref_author_metadata_cache.json`: versioned DOI author-list metadata used for reproducible name and affiliation reconciliation.
 - `wikipedia_profile_cache.json`: cached Wikipedia/Wikidata enrichment lookups.
 - `pdfs/`: downloaded open-access PDFs.
-- Formal-report mode also produces a validated UTF-8 JSON source and a Chinese PDF under the requested output path. Read `references/report-data-schema.md` before creating the JSON.
+- Formal-report mode also produces a validated UTF-8 JSON source for the required Chinese PDF. Read `references/report-data-schema.md` before creating the JSON.
 
 `citation_report.xlsx` sheets:
 

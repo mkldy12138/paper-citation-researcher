@@ -24,8 +24,8 @@
 - 保留 OpenAlex 的逐作者机构并与 Semantic Scholar 作者ID合并；同一引用记录中的 NVIDIA、Google/DeepMind、Microsoft、TikTok/ByteDance 等机构直接形成企业署名证据。
 - 对优先作者并发执行定向 Deep Search：姓名+机构、IEEE/ACM/AAAI Fellow、各国科学院/Royal Society，以及学校或个人主页。
 - 逐条核验院士、Fellow、奖项和企业归属，无法唯一对应时不纳入核心结果。
-- 自动生成 `citation_report.xlsx` 和可浏览的 HTML 调查面板。
-- 从经过验证的JSON生成中文PDF报告，包含总览表、逐人证据、企业作者、检索范围、限制和排除项。
+- 自动生成 `citation_report.xlsx` 和可浏览的 HTML 调查面板，作为可审计的数据底稿。
+- 每次面向用户的正式调查都必须从经过验证的JSON生成中文PDF报告，包含总览表、逐人证据、企业作者、检索范围、限制和排除项；只有 Excel、HTML 或 JSON 时不算完成。
 - 正式报告坚持“一人一节、一篇引文一条证据”，同时呈现引用原文、方法/背景/基线/数据集类型和中文技术说明。
 - 支持多篇论文，每篇论文独立分表，不把所有姓名混在同一张表中。
 
@@ -101,7 +101,7 @@ python scripts/paper_citation_researcher.py report `
   --strict-report
 ```
 
-PDF输入JSON格式见 `references/report-data-schema.md`。生成后应使用 Poppler 等工具渲染为PNG，逐页检查表格裁切、文字重叠、中文字体和链接可读性。
+PDF输入JSON格式见 `references/report-data-schema.md`。生成后必须使用 Poppler 等工具渲染为PNG，逐页检查表格裁切、文字重叠、中文字体和链接可读性。最终答复必须直接给出PDF文件的绝对可点击路径，并同时说明页数和逐页检查结果；不得只交付 Excel、HTML、JSON、命令或生成说明。
 
 需要达到详细 AMiner 报告的信息量时，使用默认的三源检索与高覆盖参数，并遵循 `references/quality-and-coverage-standard.md`。信息量对齐的是检索深度和逐人证据密度，不会用仅有高 h 指数、但不属于院士/Fellow/顶级奖项/头部企业类别的普通作者凑数。
 
@@ -141,12 +141,12 @@ python scripts/benchmark_author_coverage.py `
 
 ## 主要输出
 
+- `高价值引用影响调查报告.pdf`：必须直接交付给用户的中文正式报告，完成逐页渲染检查后才能作为最终结果
 - `citation_report.xlsx`：引用论文、作者、荣誉、企业、可信度、主页和正文引用位置
 - `citation_dashboard.html`：可视化浏览与核验面板
 - `pdfs/`：按需下载的高价值引用论文全文
 - `manual_download_todo`：无法自动获取全文时的人工补充清单
 - `report.json`：正式PDF的可审计结构化数据源
-- `高价值引用影响调查报告.pdf`：中文正式报告
 
 多篇目标论文的最终汇总表应为每篇论文分别设置“高价值学者”和“企业引用”工作表，并只保留一个最终工作簿。
 
