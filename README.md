@@ -20,6 +20,7 @@
 - 来源遇到429、临时5xx或超时时立即隔离；若同一目标存在近期成功快照，则以 `cached_fallback` 明示回退，避免坏网络覆盖好结果。
 - 优先保留有正文证据的正面评价，并区分正面评价、方法采用/比较和普通提及。
 - 使用作者ID、机构、研究方向、论文署名和官方主页进行保守身份解析。
+- 对带 DOI 的引文作者表默认进行 Crossref 校正；仅在题名、作者总数、作者顺序和其余合作者共同支持时修复硬冲突，并完整保留原始姓名、原始来源 ID、校正类型、证据链接和置信度。缩写、重音、空格、连字符等规范写法差异保留作者 ID；硬冲突校正自动进入 DBLP 精确姓名+机构消歧、官方主页/Biography、荣誉和画像核验队列。Semantic Scholar 姓名检索若没有严格等价结果则明确拒绝，不再取“最高引用的近似姓名”。
 - 保留 OpenAlex 的逐作者机构并与 Semantic Scholar 作者ID合并；同一引用记录中的 NVIDIA、Google/DeepMind、Microsoft、TikTok/ByteDance 等机构直接形成企业署名证据。
 - 对优先作者并发执行定向 Deep Search：姓名+机构、IEEE/ACM/AAAI Fellow、各国科学院/Royal Society，以及学校或个人主页。
 - 逐条核验院士、Fellow、奖项和企业归属，无法唯一对应时不纳入核心结果。
@@ -72,6 +73,15 @@ python scripts/paper_citation_researcher.py analyze --output ".\out"
 python scripts/paper_citation_researcher.py dashboard --output ".\out"
 python scripts/paper_citation_researcher.py report --output ".\out" --strict-report
 ```
+
+作者校正默认并发执行，可按来源限流情况调整：
+
+```powershell
+python scripts/paper_citation_researcher.py authors --output ".\out" `
+  --canonical-author-workers 8 --canonical-author-rps 5
+```
+
+如需复现实验而完全禁用 DOI 作者元数据校正，可显式添加 `--no-canonical-author-metadata`。
 
 Google Scholar 默认关闭。确需使用时显式加入来源；用户给出了论文详情页时，可同时指定它以避免同题版本匹配失败：
 

@@ -34,6 +34,9 @@ assert args.author_top_n == 100
 assert args.homepage_search_limit == 250
 assert args.author_workers == 8
 assert args.author_failure_policy == "skip"
+assert args.canonical_author_metadata is True
+assert args.canonical_author_workers == 8
+assert args.canonical_author_rps == 5.0
 assert args.wiki_workers == 4
 assert args.download_workers == 8
 assert args.analyze_workers == 4

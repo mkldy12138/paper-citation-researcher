@@ -8,11 +8,12 @@ Use this model for all full and high-coverage runs. The pipeline follows Map-Bar
 2. **Metadata expansion**: after OpenCitations returns DOI links, fetch Crossref metadata with `--metadata-workers 12` and pace request starts with `--metadata-rps 5`. Preserve the original DOI order after the barrier.
 3. **Discovery reduction**: wait for all source workers, then merge and deduplicate. Never write a partial workbook while another source is still running.
    After the barrier, persist one independent snapshot per successful source. A 429/5xx/timeout may use a recent same-target snapshot labeled `cached_fallback`; do not retry a temporarily unavailable source in `skip` mode.
-4. **Author metrics**: probe Semantic Scholar once in the default skip mode. Fan out independent author profiles with `--author-workers 8` only if the probe succeeds; on 429/5xx/timeout open a circuit and keep the skipped entries retryable. Keep Google Scholar profile access serial.
-5. **Honor/homepage evidence**: use `--wiki-workers 4` for Wikipedia, Wikidata, direct homepages, and fallback homepage searches. Complete identity checks after all evidence tasks finish.
-6. **PDF download**: use `--download-workers 8`. Each worker writes a distinct file; write the manifest after the barrier.
-7. **PDF context analysis**: use `--analyze-workers 4`. Analyze separate PDFs concurrently, then reduce contexts in original paper order before writing Excel/HTML.
-8. **Formal outputs**: write Excel, JSON, dashboard, and PDF serially. Never allow concurrent writers to the same artifact.
+4. **DOI author canonicalization**: before profile lookup, fetch independent Crossref author lists with `--canonical-author-workers 8` and `--canonical-author-rps 5`. Wait for the full DOI batch, then reconcile in original paper/author order. Cache successful records by DOI and metadata-rule version; never cache 429/5xx/timeout failures so the next run can retry them.
+5. **Author metrics**: probe Semantic Scholar once in the default skip mode. Fan out independent author profiles with `--author-workers 8` only if the probe succeeds; on 429/5xx/timeout open a circuit and keep the skipped entries retryable. Keep Google Scholar profile access serial.
+6. **Corrected-name identity and honor/homepage evidence**: hard name conflicts fan out to DBLP exact-name/affiliation resolution first. Cache terminal identity decisions; transient TLS/429/5xx/timeout failures enter a one-hour cooldown and remain retryable afterward. Then use `--wiki-workers 4` for Wikipedia, Wikidata, direct homepages (including same-site biography pages), and fallback homepage searches. A Wikipedia 429 skips directly to Wikidata instead of aborting the author. Complete identity checks after all evidence tasks finish.
+7. **PDF download**: use `--download-workers 8`. Each worker writes a distinct file; write the manifest after the barrier.
+8. **PDF context analysis**: use `--analyze-workers 4`. Analyze separate PDFs concurrently, then reduce contexts in original paper order before writing Excel/HTML.
+9. **Formal outputs**: write Excel, JSON, dashboard, and PDF serially. Never allow concurrent writers to the same artifact.
 
 ## Safety Rules
 

@@ -28,6 +28,7 @@ Discovery columns:
 - `citing_authors`: display author string from the source platform.
 - `citing_authors_json`: JSON list of structured author objects when available, e.g. `[{ "name": "...", "authorId": "..." }]`.
 - `citing_author_ids`: semicolon-separated Semantic Scholar author IDs when available.
+- `author_name_corrections_json`: audit log for DOI-based name corrections, including author order, original/canonical names, correction type, confidence, source URL, alignment evidence, and any rejected provider author ID.
 - `publication_year`, `venue`, `doi`, `url`, `pdf_url`, `open_access_pdf_url`.
 - `citation_count`: citation count for the citing paper. Google Scholar and Semantic Scholar rows always provide this value; use `0` when the source has no citation count.
 - `semantic_scholar_paper_id`, `google_scholar_cited_by_url`, `arxiv_id`, `acl_id`, `abstract`.
@@ -68,6 +69,8 @@ One row per author on each citing paper.
 - `author_order`: 1-based author order in the citing paper when known.
 - `author_key`: author dedupe key, preferring `s2:<authorId>` and falling back to `name:<normalized name>`.
 - `name`, `normalized_name`, `semantic_author_id`.
+- `original_names`, `name_correction_types`, `name_correction_sources`, `name_correction_evidence`, `name_correction_confidence`: provenance retained when the citing-paper author name was canonicalized. A hard source conflict has no accepted Semantic Scholar ID for the corrected identity.
+- `orcid`, `dblp_author_url`, `identity_resolution_sources`, `identity_resolution_evidence`, `identity_resolution_confidence`: canonical-identity evidence recovered after a supported hard correction. DBLP results require strict name and affiliation disambiguation.
 - `is_target_author`: `True` when the author matches a target-paper author by `authorId` or normalized name.
 - `target_author_match`: match explanation, such as `author_id` or `normalized_name`.
 - `selected_citation_count`, `selected_citation_source`: personal citation count used for ranking.
@@ -79,6 +82,8 @@ Non-target author ranking. Target-paper authors are excluded from this sheet by 
 
 - `rank`: rank after selecting the best available personal citation count.
 - `author_key`, `name`, `normalized_name`, `semantic_author_id`.
+- `original_names`, `name_correction_types`, `name_correction_sources`, `name_correction_evidence`, `name_correction_confidence`: aggregate name-correction audit trail across the author's citing papers. `hard_source_conflict` rows are automatically prioritized for correct-name profile, honor, and homepage verification.
+- `orcid`, `dblp_author_url`, `identity_resolution_sources`, `identity_resolution_evidence`, `identity_resolution_confidence`: accepted canonical identity and its audit trail. These fields do not reinstate a rejected source-provider ID.
 - `is_target_author`: should be `False` for normal rows.
 - `target_author_match`: retained for auditing if a row is ever excluded or debug-exported.
 - `citing_paper_count`: number of citing papers in which the author appears.
@@ -180,6 +185,8 @@ High-quality authors and the citing papers in which they cite the target. By def
 - `value`: recorded parameter, count, status, or statistic.
 
 Network tuning notes are recorded here when present, including `find.workers`, `authors.semantic_scholar_workers`, and `authors.wikipedia_workers`.
+
+DOI author canonicalization diagnostics use `authors.canonicalization.*`, including enabled state, DOI rows, newly queried DOIs, corrected papers/names, affiliation enrichment, title/count/alignment rejections, worker count, and request rate. Raw DOI metadata is cached in `crossref_author_metadata_cache.json`.
 
 Google Scholar discovery diagnostics are recorded here when present:
 

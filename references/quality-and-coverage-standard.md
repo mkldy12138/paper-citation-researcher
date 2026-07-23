@@ -16,6 +16,7 @@ The reference GPUSQ report contains 72 reported citations, 15 detailed author re
    - pass 1: stable author IDs, affiliations, honor rosters, and company institutions;
    - pass 2: reverse-match complete academy/Fellow/award rosters and search unresolved high-priority names.
 6. Stop only after a saturation pass adds no new verified high-value person, or document the remaining limitation.
+7. For DOI-bearing citing papers, reconcile author names before profile/honor lookup. Treat initials, accents, whitespace, hyphens, and omitted middle names as canonical variants only when the DOI author position supports them. For a genuinely different given name, require an exact title, equal author counts, identical position, one and only one conflicting position, at least three aligned coauthors, a matching surname, and canonical affiliation evidence. Retain the rejected provider ID only as audit provenance; never use it to inherit metrics or honors. Resolve the corrected identity independently through an exact-name and affiliation-matched DBLP profile or equivalently authoritative record. A name-search provider may contribute metrics only when the returned name is strictly equivalent; a high citation count never compensates for a name mismatch.
 
 ## Allowed Main Categories
 

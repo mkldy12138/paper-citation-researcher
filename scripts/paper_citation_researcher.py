@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -63,6 +64,7 @@ CITING_COLUMNS = [
     "citing_authors",
     "citing_authors_json",
     "citing_author_ids",
+    "author_name_corrections_json",
     "publication_year",
     "venue",
     "doi",
@@ -80,7 +82,9 @@ CITING_COLUMNS = [
 S2_FIELDS = "title,externalIds,year,venue,authors,paperId,url,citationCount,openAccessPdf"
 S2_MAX_RETRY_DELAY = 60
 GOOGLE_AUTHOR_TIMEOUT = 10
-PROFILE_ENRICHMENT_VERSION = "2026-07-22-profile-v8-deep-honor-company"
+PROFILE_ENRICHMENT_VERSION = "2026-07-23-profile-v10-expanded-wikipedia"
+AUTHOR_CANONICALIZATION_VERSION = "2026-07-23-crossref-author-v1"
+DBLP_IDENTITY_VERSION = "2026-07-23-dblp-identity-v1"
 _HTTP_THREAD_LOCAL = threading.local()
 
 
@@ -164,6 +168,16 @@ AUTHOR_COLUMNS = [
     "source_affiliations",
     "source_company_affiliations",
     "company_affiliation_evidence",
+    "original_names",
+    "name_correction_types",
+    "name_correction_sources",
+    "name_correction_evidence",
+    "name_correction_confidence",
+    "orcid",
+    "dblp_author_url",
+    "identity_resolution_sources",
+    "identity_resolution_evidence",
+    "identity_resolution_confidence",
     "is_target_author",
     "target_author_match",
     "citing_paper_count",
@@ -310,6 +324,16 @@ PAPER_AUTHOR_COLUMNS = [
     "source_affiliations",
     "source_company_affiliations",
     "company_affiliation_evidence",
+    "original_names",
+    "name_correction_types",
+    "name_correction_sources",
+    "name_correction_evidence",
+    "name_correction_confidence",
+    "orcid",
+    "dblp_author_url",
+    "identity_resolution_sources",
+    "identity_resolution_evidence",
+    "identity_resolution_confidence",
     "is_target_author",
     "target_author_match",
     "selected_citation_count",
@@ -1309,6 +1333,322 @@ async def async_crossref_metadata(
             if completed % 25 == 0 or completed == len(tasks):
                 print(f"Async Crossref metadata collected: {completed}/{len(tasks)}")
         return results
+
+
+def crossref_author_entries(metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for author in metadata.get("author") or []:
+        given = str(author.get("given") or "").strip()
+        family = str(author.get("family") or "").strip()
+        name = " ".join(part for part in (given, family) if part).strip()
+        if not name:
+            continue
+        institutions = []
+        for affiliation in author.get("affiliation") or []:
+            institution_name = str(affiliation.get("name") or "").strip()
+            if institution_name:
+                institutions.append({"name": institution_name, "id": "", "type": "", "country_code": ""})
+        entries.append(
+            {
+                "name": name,
+                "orcid": str(author.get("ORCID") or ""),
+                "institutions": institutions,
+            }
+        )
+    return entries
+
+
+def ascii_author_name_tokens(value: str) -> List[str]:
+    folded = unicodedata.normalize("NFKD", str(value or ""))
+    folded = "".join(character for character in folded if not unicodedata.combining(character))
+    return normalize_text(folded).split()
+
+
+def strict_author_name_equivalent(left: str, right: str) -> bool:
+    left_tokens = ascii_author_name_tokens(left)
+    right_tokens = ascii_author_name_tokens(right)
+    if not left_tokens or not right_tokens:
+        return False
+    if left_tokens == right_tokens or sorted(left_tokens) == sorted(right_tokens):
+        return True
+    if "".join(left_tokens) == "".join(right_tokens):
+        return True
+    if len(left_tokens) < 2 or len(right_tokens) < 2 or left_tokens[-1] != right_tokens[-1]:
+        return False
+    left_full = [token for token in left_tokens[:-1] if len(token) > 1]
+    right_full = [token for token in right_tokens[:-1] if len(token) > 1]
+    return bool(left_full and left_full == right_full)
+
+
+def author_name_token_equivalent(left: str, right: str) -> bool:
+    left_tokens = ascii_author_name_tokens(left)
+    right_tokens = ascii_author_name_tokens(right)
+    left_norm = " ".join(left_tokens)
+    right_norm = " ".join(right_tokens)
+    if not left_norm or not right_norm:
+        return False
+    if left_norm == right_norm:
+        return True
+    if len(left_tokens) >= 2 and sorted(left_tokens) == sorted(right_tokens):
+        return True
+    if "".join(left_tokens) == "".join(right_tokens):
+        return True
+    if len(left_tokens) < 2 or len(right_tokens) < 2 or left_tokens[-1] != right_tokens[-1]:
+        return False
+    left_given = left_tokens[:-1]
+    right_given = right_tokens[:-1]
+    left_full = [token for token in left_given if len(token) > 1]
+    right_full = [token for token in right_given if len(token) > 1]
+    if left_full == right_full and (left_full or right_full):
+        return True
+    if left_given and all(len(token) == 1 for token in left_given):
+        return all(
+            index < len(right_given) and initial == right_given[index][0]
+            for index, initial in enumerate(left_given)
+        )
+    if right_given and all(len(token) == 1 for token in right_given):
+        return all(
+            index < len(left_given) and initial == left_given[index][0]
+            for index, initial in enumerate(right_given)
+        )
+    return False
+
+
+def author_surname(name: str) -> str:
+    tokens = normalize_text(name).split()
+    return tokens[-1] if tokens else ""
+
+
+def crossref_title_matches(citing_title: str, metadata: Dict[str, Any]) -> bool:
+    crossref_title = str((metadata.get("title") or [""])[0] or "")
+    if not citing_title or not crossref_title:
+        return False
+    left = normalize_text(citing_title)
+    right = normalize_text(crossref_title)
+    return left == right or SequenceMatcher(None, left, right).ratio() >= 0.90
+
+
+def merge_author_institutions(
+    source: Sequence[Dict[str, Any]],
+    canonical: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    merged = [dict(item) for item in source if isinstance(item, dict)]
+    seen = {normalize_text(item.get("name", "")) for item in merged if item.get("name")}
+    for institution in canonical:
+        if not isinstance(institution, dict) or not institution.get("name"):
+            continue
+        key = normalize_text(institution.get("name", ""))
+        if key and key not in seen:
+            merged.append(dict(institution))
+            seen.add(key)
+    return merged
+
+
+def reconcile_crossref_author_entries(
+    source_entries: Sequence[Dict[str, Any]],
+    metadata: Dict[str, Any],
+    doi: str,
+    citing_title: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+    source = [dict(item) for item in source_entries]
+    canonical = crossref_author_entries(metadata)
+    if not crossref_title_matches(citing_title, metadata):
+        return source, [], "title_mismatch"
+    if len(source) < 2 or len(source) != len(canonical):
+        return source, [], "author_count_mismatch"
+
+    equivalent = [
+        author_name_token_equivalent(
+            source_item.get("originalName") or source_item.get("name", ""),
+            canonical_item.get("name", ""),
+        )
+        for source_item, canonical_item in zip(source, canonical)
+    ]
+    mismatch_indexes = [index for index, matched in enumerate(equivalent) if not matched]
+    if mismatch_indexes:
+        mismatch_index = mismatch_indexes[0]
+        hard_conflict_supported = bool(
+            len(mismatch_indexes) == 1
+            and len(source) >= 4
+            and sum(equivalent) == len(source) - 1
+            and author_surname(
+                source[mismatch_index].get("originalName")
+                or source[mismatch_index].get("name", "")
+            )
+            == author_surname(canonical[mismatch_index].get("name", ""))
+            and canonical[mismatch_index].get("institutions")
+        )
+        if not hard_conflict_supported:
+            return source, [], "insufficient_coauthor_alignment"
+
+    corrected: List[Dict[str, Any]] = []
+    corrections: List[Dict[str, Any]] = []
+    aligned_count = sum(equivalent)
+    source_url = f"https://api.crossref.org/works/{urllib.parse.quote(clean_doi(doi), safe='')}"
+    for index, (source_item, canonical_item) in enumerate(zip(source, canonical), 1):
+        item = dict(source_item)
+        original_name = str(item.get("originalName") or item.get("name") or "")
+        canonical_name = str(canonical_item.get("name") or "")
+        hard_conflict = not author_name_token_equivalent(original_name, canonical_name)
+        item["institutions"] = merge_author_institutions(
+            item.get("institutions") or [],
+            canonical_item.get("institutions") or [],
+        )
+        if canonical_item.get("orcid"):
+            item["orcid"] = canonical_item["orcid"]
+        if normalize_text(original_name) != normalize_text(canonical_name):
+            evidence = (
+                f"DOI {clean_doi(doi)} author position {index}; Crossref title matched; "
+                + (
+                    f"{aligned_count}/{len(source)} other-position names aligned"
+                    if hard_conflict
+                    else f"{aligned_count}/{len(source)} author positions identity-aligned"
+                )
+            )
+            aliases = list(item.get("nameAliases") or [])
+            if original_name and original_name not in aliases:
+                aliases.append(original_name)
+            item.update(
+                {
+                    "name": canonical_name,
+                    "originalName": original_name,
+                    "nameAliases": aliases,
+                    "nameCorrectionSource": "Crossref DOI metadata",
+                    "nameCorrectionType": (
+                        "hard_source_conflict" if hard_conflict else "canonical_name_variant"
+                    ),
+                    "nameCorrectionEvidence": evidence,
+                    "nameCorrectionConfidence": "high",
+                }
+            )
+            rejected_source_author_id = ""
+            if hard_conflict:
+                rejected_source_author_id = str(
+                    item.get("semanticAuthorId")
+                    or item.get("authorId")
+                    or item.get("sourceAuthorId")
+                    or ""
+                )
+                item["sourceAuthorId"] = rejected_source_author_id
+                item["authorId"] = ""
+                item["authorIdType"] = ""
+                item["semanticAuthorId"] = ""
+            elif not item.get("authorId") and item.get("sourceAuthorId"):
+                item["authorId"] = item["sourceAuthorId"]
+                item["authorIdType"] = "semantic-scholar"
+                item["semanticAuthorId"] = item["sourceAuthorId"]
+            corrections.append(
+                {
+                    "author_order": index,
+                    "original_name": original_name,
+                    "canonical_name": canonical_name,
+                    "correction_type": "hard_source_conflict" if hard_conflict else "canonical_name_variant",
+                    "confidence": "high",
+                    "source": "Crossref DOI metadata",
+                    "source_url": source_url,
+                    "evidence": evidence,
+                    "rejected_source_author_id": rejected_source_author_id,
+                }
+            )
+        corrected.append(item)
+    return corrected, corrections, "reconciled"
+
+
+def compact_crossref_author_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "DOI": metadata.get("DOI", ""),
+        "URL": metadata.get("URL", ""),
+        "title": metadata.get("title") or [],
+        "author": metadata.get("author") or [],
+        "_metadata_error": metadata.get("_metadata_error", ""),
+    }
+
+
+def canonicalize_citing_authors(
+    output: str | Path,
+    papers: pd.DataFrame,
+    workers: int = 8,
+    requests_per_second: float = 5.0,
+    enabled: bool = True,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    papers = clean_frame_for_report(papers, PAPER_COLUMNS)
+    stats = {
+        "enabled": enabled,
+        "doi_rows": 0,
+        "queried_dois": 0,
+        "corrected_papers": 0,
+        "corrections": 0,
+        "affiliation_enriched_papers": 0,
+        "title_mismatches": 0,
+        "author_count_mismatches": 0,
+        "insufficient_alignment": 0,
+    }
+    if not enabled or papers.empty:
+        return papers, stats
+
+    cache_path = Path(output) / "crossref_author_metadata_cache.json"
+    cache_payload = load_cache(cache_path)
+    if cache_payload.get("version") != AUTHOR_CANONICALIZATION_VERSION:
+        cache_payload = {"version": AUTHOR_CANONICALIZATION_VERSION, "records": {}}
+    cache_records = cache_payload.setdefault("records", {})
+    doi_rows: Dict[str, List[int]] = {}
+    paper_records = papers.to_dict("records")
+    for index, row in enumerate(paper_records):
+        doi = normalized_doi_value(row.get("doi"))
+        if doi and len(parse_author_json(row.get("citing_authors_json"))) >= 2:
+            doi_rows.setdefault(doi, []).append(index)
+    stats["doi_rows"] = sum(len(indexes) for indexes in doi_rows.values())
+    pending = [doi for doi in doi_rows if doi not in cache_records]
+    if pending:
+        metadata_by_index = asyncio.run(
+            async_crossref_metadata(pending, workers, "skip", requests_per_second)
+        )
+        for index, doi in enumerate(pending):
+            compact = compact_crossref_author_metadata(metadata_by_index.get(index, {}))
+            if compact.get("_metadata_error") or not compact.get("author"):
+                continue
+            cache_records[doi] = compact
+        stats["queried_dois"] = len(pending)
+        save_cache(cache_path, cache_payload)
+
+    for doi, indexes in doi_rows.items():
+        metadata = cache_records.get(doi) or {}
+        if not metadata or metadata.get("_metadata_error") or not metadata.get("author"):
+            continue
+        for index in indexes:
+            row = paper_records[index]
+            entries = parse_author_json(row.get("citing_authors_json"))
+            before_affiliations = sum(len(entry.get("institutions") or []) for entry in entries)
+            reconciled, corrections, status = reconcile_crossref_author_entries(
+                entries,
+                metadata,
+                doi,
+                str(row.get("citing_title") or ""),
+            )
+            if status == "title_mismatch":
+                stats["title_mismatches"] += 1
+            elif status == "author_count_mismatch":
+                stats["author_count_mismatches"] += 1
+            elif status == "insufficient_coauthor_alignment":
+                stats["insufficient_alignment"] += 1
+            if status != "reconciled":
+                continue
+            after_affiliations = sum(len(entry.get("institutions") or []) for entry in reconciled)
+            if after_affiliations > before_affiliations:
+                stats["affiliation_enriched_papers"] += 1
+            if corrections:
+                stats["corrected_papers"] += 1
+                stats["corrections"] += len(corrections)
+                row["author_name_corrections_json"] = json.dumps(corrections, ensure_ascii=False)
+            row["citing_authors_json"] = json.dumps(reconciled, ensure_ascii=False)
+            row["citing_authors"] = ", ".join(entry.get("name", "") for entry in reconciled)
+            row["citing_author_ids"] = ";".join(
+                str(entry.get("authorId") or "")
+                for entry in reconciled
+                if entry.get("authorId")
+            )
+            paper_records[index] = row
+    return clean_frame_for_report(pd.DataFrame(paper_records), PAPER_COLUMNS), stats
 
 
 def opencitations_fetch_citations(
@@ -3375,6 +3715,14 @@ def parse_author_json(value: Any) -> List[Dict[str, Any]]:
                         or ""
                     ),
                     "institutions": institutions,
+                    "orcid": str(item.get("orcid") or ""),
+                    "originalName": str(item.get("originalName") or ""),
+                    "nameAliases": [str(value) for value in item.get("nameAliases") or [] if value],
+                    "nameCorrectionSource": str(item.get("nameCorrectionSource") or ""),
+                    "nameCorrectionType": str(item.get("nameCorrectionType") or ""),
+                    "nameCorrectionEvidence": str(item.get("nameCorrectionEvidence") or ""),
+                    "nameCorrectionConfidence": str(item.get("nameCorrectionConfidence") or ""),
+                    "sourceAuthorId": str(item.get("sourceAuthorId") or ""),
                 }
             )
     return out
@@ -3503,6 +3851,12 @@ def collect_author_candidates_from_papers(df: pd.DataFrame) -> Tuple[List[Dict[s
                     "source_affiliations_list": [],
                     "source_company_affiliations_list": [],
                     "company_affiliation_evidence_list": [],
+                    "original_names_list": [],
+                    "name_correction_types_list": [],
+                    "name_correction_sources_list": [],
+                    "name_correction_evidence_list": [],
+                    "name_correction_confidence_list": [],
+                    "orcid_list": [],
                     "papers": [],
                 },
             )
@@ -3519,6 +3873,18 @@ def collect_author_candidates_from_papers(df: pd.DataFrame) -> Tuple[List[Dict[s
                         f"{company}: {institution} @ {row.get('citing_title', '')}",
                         limit=30,
                     )
+            if entry.get("originalName"):
+                append_unique(item["original_names_list"], str(entry.get("originalName")), limit=20)
+            if entry.get("nameCorrectionType"):
+                append_unique(item["name_correction_types_list"], str(entry.get("nameCorrectionType")), limit=10)
+            if entry.get("nameCorrectionSource"):
+                append_unique(item["name_correction_sources_list"], str(entry.get("nameCorrectionSource")), limit=20)
+            if entry.get("nameCorrectionEvidence"):
+                append_unique(item["name_correction_evidence_list"], str(entry.get("nameCorrectionEvidence")), limit=30)
+            if entry.get("nameCorrectionConfidence"):
+                append_unique(item["name_correction_confidence_list"], str(entry.get("nameCorrectionConfidence")), limit=10)
+            if entry.get("orcid"):
+                append_unique(item["orcid_list"], str(entry.get("orcid")), limit=10)
             if len(name) > len(str(item.get("name") or "")):
                 item["name"] = name
             item["papers"].append(
@@ -3540,6 +3906,12 @@ def collect_author_candidates_from_papers(df: pd.DataFrame) -> Tuple[List[Dict[s
         item["source_affiliations"] = " | ".join(item.pop("source_affiliations_list", []))
         item["source_company_affiliations"] = " | ".join(item.pop("source_company_affiliations_list", []))
         item["company_affiliation_evidence"] = " | ".join(item.pop("company_affiliation_evidence_list", []))
+        item["original_names"] = " | ".join(item.pop("original_names_list", []))
+        item["name_correction_types"] = " | ".join(item.pop("name_correction_types_list", []))
+        item["name_correction_sources"] = " | ".join(item.pop("name_correction_sources_list", []))
+        item["name_correction_evidence"] = " | ".join(item.pop("name_correction_evidence_list", []))
+        item["name_correction_confidence"] = " | ".join(item.pop("name_correction_confidence_list", []))
+        item["orcid"] = " | ".join(item.pop("orcid_list", []))
     return list(candidates.values()), df
 
 
@@ -3585,8 +3957,17 @@ def author_metric_cache_key(candidate: Dict[str, Any], name: str = "") -> str:
     return f"name:{normalized}"
 
 
-def author_profile_priority(candidate: Dict[str, Any]) -> Tuple[int, int, int, int]:
+def has_hard_name_correction(candidate: Dict[str, Any]) -> bool:
+    return "hard_source_conflict" in {
+        part.strip()
+        for part in str(candidate.get("name_correction_types") or "").split("|")
+        if part.strip()
+    }
+
+
+def author_profile_priority(candidate: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
     return (
+        1 if has_hard_name_correction(candidate) else 0,
         1 if candidate.get("semantic_author_id") else 0,
         parse_int(candidate.get("max_citing_paper_citation_count")),
         parse_int(candidate.get("sum_citing_paper_citation_count")),
@@ -3599,6 +3980,31 @@ def numeric_arg(args: argparse.Namespace, name: str, default: int | float, cast)
     if value is None or value == "":
         return default
     return cast(value)
+
+
+def select_s2_author_search_candidate(
+    candidates: Sequence[Dict[str, Any]],
+    requested_name: str,
+) -> Optional[Dict[str, Any]]:
+    identity_matches = [
+        item
+        for item in candidates
+        if strict_author_name_equivalent(str(item.get("name") or ""), requested_name)
+    ]
+    if not identity_matches:
+        return None
+    return max(identity_matches, key=lambda item: parse_int(item.get("citationCount")))
+
+
+def cached_s2_author_identity_valid(candidate: Dict[str, Any], metric: Dict[str, Any]) -> bool:
+    if not metric or metric.get("error"):
+        return True
+    if candidate.get("semantic_author_id"):
+        return True
+    return strict_author_name_equivalent(
+        str(candidate.get("name") or ""),
+        str(metric.get("name") or ""),
+    )
 
 
 def s2_author_metrics(
@@ -3633,13 +4039,16 @@ def s2_author_metrics(
             )
             if response.ok:
                 candidates = response.json().get("data", [])
-                exact = [
-                    item for item in candidates
-                    if normalized_author_name(item.get("name", "")) == normalized_author_name(name)
-                ]
-                pool = exact or candidates
-                if pool:
-                    return max(pool, key=lambda item: parse_int(item.get("citationCount")))
+                selected = select_s2_author_search_candidate(candidates, name)
+                if selected:
+                    return selected
+                returned_names = "; ".join(
+                    str(item.get("name") or "") for item in candidates[:5] if item.get("name")
+                )
+                return {
+                    "error": f"author_search_no_identity_match: requested={name}; returned={returned_names}",
+                    "retryable": False,
+                }
             return {"error": s2_error_message(response, "author search")}
     except Exception as exc:
         return {"error": str(exc)}
@@ -4431,6 +4840,7 @@ def wikidata_evidence(session: requests.Session, qid: str) -> Dict[str, str]:
                 claim_ids.append((prop, prop_label, value["id"]))
     labels = wikidata_label_map(session, [claim_qid for _, _, claim_qid in claim_ids])
     evidence_parts = []
+    wikidata_affiliations: List[str] = []
     buckets = {
         "academic_titles": [],
         "honors_awards": [],
@@ -4454,6 +4864,8 @@ def wikidata_evidence(session: requests.Session, qid: str) -> Dict[str, str]:
                 category = ""
         if category:
             append_unique(buckets[category], phrase)
+        if prop in {"P108", "P1416"}:
+            append_unique(wikidata_affiliations, label, limit=20)
         text_buckets = classify_profile_evidence([phrase])
         for bucket_name, bucket_text in text_buckets.items():
             for part in split_evidence_parts(bucket_text):
@@ -4461,6 +4873,19 @@ def wikidata_evidence(session: requests.Session, qid: str) -> Dict[str, str]:
         if prop_label in {"award received", "member of", "position held"} or EXPERT_EVIDENCE_RE.search(phrase):
             evidence_parts.append(phrase)
     evidence_text = " | ".join(dict.fromkeys(evidence_parts))
+    claims = entity.get("claims") or {}
+
+    def string_claim(prop: str) -> str:
+        for claim in claims.get(prop, []):
+            value = claim.get("mainsnak", {}).get("datavalue", {}).get("value")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    orcid_id = string_claim("P496")
+    dblp_pid = string_claim("P2456")
+    scholar_id = string_claim("P1960")
+    official_website = string_claim("P856")
     return {
         "wikidata_description": description,
         "wikidata_evidence": evidence_text,
@@ -4468,6 +4893,15 @@ def wikidata_evidence(session: requests.Session, qid: str) -> Dict[str, str]:
         "honors_awards": " | ".join(buckets["honors_awards"]),
         "professional_memberships": " | ".join(buckets["professional_memberships"]),
         "leadership_roles": " | ".join(buckets["leadership_roles"]),
+        "wikidata_affiliations": " | ".join(wikidata_affiliations),
+        "orcid": f"https://orcid.org/{orcid_id}" if orcid_id else "",
+        "dblp_author_url": f"https://dblp.org/pid/{dblp_pid}" if dblp_pid else "",
+        "google_scholar_profile_url": (
+            f"https://scholar.google.com/citations?user={urllib.parse.quote(scholar_id)}"
+            if scholar_id
+            else ""
+        ),
+        "personal_homepage_url": plausible_personal_homepage_url(official_website),
     }
 
 
@@ -4561,7 +4995,7 @@ def wikipedia_page_profile_text(session: requests.Session, title: str) -> Dict[s
             re.sub(r"\s+", " ", paragraph.get_text(" ", strip=True)).strip()
             for paragraph in soup.select("p")
             if paragraph.get_text(" ", strip=True)
-        ][:5]
+        ][:20]
         infobox_parts = []
         for table in soup.select("table.infobox")[:1]:
             for row in table.select("tr"):
@@ -4609,6 +5043,247 @@ def plausible_personal_homepage_url(url: Any) -> str:
     return urllib.parse.urlunparse(parsed._replace(fragment=""))
 
 
+def dblp_display_name(value: str) -> str:
+    return re.sub(r"\s+\d{4}$", "", str(value or "").strip())
+
+
+def dblp_affiliations(info: Dict[str, Any]) -> List[str]:
+    notes = (info.get("notes") or {}).get("note") or []
+    if isinstance(notes, dict):
+        notes = [notes]
+    return [
+        str(note.get("text") or "").strip()
+        for note in notes
+        if isinstance(note, dict)
+        and str(note.get("@type") or "") == "affiliation"
+        and note.get("text")
+    ]
+
+
+def affiliation_identity_score(source_affiliations: str, candidate_affiliations: Sequence[str]) -> float:
+    source_parts = [
+        part.strip()
+        for part in re.split(r"[;|]", str(source_affiliations or ""))
+        if part.strip()
+    ]
+    if not source_parts or not candidate_affiliations:
+        return 0.0
+    return max(
+        max(token_overlap(source, candidate), token_overlap(candidate, source))
+        for source in source_parts
+        for candidate in candidate_affiliations
+    )
+
+
+def windows_web_text_fallback(url: str, timeout: int = 25) -> str:
+    if os.name != "nt":
+        return ""
+    safe_url = str(url or "").replace("'", "''")
+    script = (
+        "$ProgressPreference='SilentlyContinue'; "
+        "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); "
+        "$last=$null; "
+        "for($i=0;$i -lt 3;$i++){try{"
+        f"(Invoke-WebRequest -UseBasicParsing -Uri '{safe_url}' -TimeoutSec {int(timeout)}).Content; "
+        "exit 0}catch{$last=$_; Start-Sleep -Milliseconds 300}}; "
+        "throw $last"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout * 3 + 15,
+            check=False,
+        )
+        return result.stdout if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def dblp_person_links(session: requests.Session, author_url: str) -> Dict[str, str]:
+    xml_url = str(author_url or "").rstrip("/") + ".xml"
+    text = ""
+    try:
+        response = session.get(xml_url, timeout=20, stream=True)
+        if response.ok:
+            content = bytearray()
+            for chunk in response.iter_content(chunk_size=8192):
+                content.extend(chunk)
+                if b"</person>" in content or len(content) >= 196608:
+                    break
+            text = bytes(content).decode("utf-8", errors="replace")
+    except Exception:
+        text = ""
+    if not text:
+        text = windows_web_text_fallback(xml_url)[:196608]
+    match = re.search(r"<person\b[\s\S]*?</person>", text)
+    if not match:
+        return {}
+    try:
+        person = ET.fromstring(match.group(0))
+    except ET.ParseError:
+        return {}
+    urls = [str(node.text or "").strip() for node in person.findall("url") if node.text]
+    homepage_url = next((url for url in urls if plausible_personal_homepage_url(url)), "")
+    orcid = next((url for url in urls if "orcid.org/" in url.lower()), "")
+    scholar_url = next((url for url in urls if "scholar.google." in url.lower()), "")
+    return {
+        "personal_homepage_url": homepage_url,
+        "orcid": orcid,
+        "google_scholar_profile_url": scholar_url,
+    }
+
+
+def dblp_author_identity(
+    session: requests.Session,
+    name: str,
+    source_affiliations: str,
+) -> Dict[str, Any]:
+    try:
+        search_url = "https://dblp.org/search/author/api?" + urllib.parse.urlencode(
+            {"q": name, "format": "json", "h": 20}
+        )
+        payload: Dict[str, Any] = {}
+        request_error = ""
+        try:
+            response = session.get(search_url, timeout=20)
+            if response.ok:
+                payload = response.json()
+            else:
+                request_error = f"http_{response.status_code}"
+        except Exception as exc:
+            request_error = str(exc)
+        if not payload:
+            fallback_text = windows_web_text_fallback(search_url)
+            if fallback_text:
+                payload = json.loads(fallback_text)
+        if not payload:
+            return {"status": "error", "error": request_error[:300]}
+        raw_hits = (((payload.get("result") or {}).get("hits") or {}).get("hit")) or []
+        if isinstance(raw_hits, dict):
+            raw_hits = [raw_hits]
+        matches = []
+        for hit in raw_hits:
+            info = hit.get("info") or {}
+            candidate_name = dblp_display_name(str(info.get("author") or ""))
+            if not author_name_token_equivalent(candidate_name, name):
+                continue
+            affiliations = dblp_affiliations(info)
+            score = affiliation_identity_score(source_affiliations, affiliations)
+            matches.append(
+                {
+                    "name": candidate_name,
+                    "author_url": str(info.get("url") or ""),
+                    "affiliations": affiliations,
+                    "affiliation_score": score,
+                }
+            )
+        if not matches:
+            return {"status": "not_found"}
+        matches.sort(key=lambda item: item["affiliation_score"], reverse=True)
+        best = matches[0]
+        if source_affiliations:
+            if best["affiliation_score"] < 0.5:
+                return {"status": "affiliation_not_matched"}
+            if len(matches) > 1 and matches[1]["affiliation_score"] == best["affiliation_score"]:
+                return {"status": "ambiguous_affiliation_match"}
+        elif len(matches) != 1:
+            return {"status": "ambiguous_name_match"}
+        links = dblp_person_links(session, best["author_url"])
+        affiliation_text = " | ".join(best["affiliations"])
+        return {
+            "status": "verified",
+            "confidence": "high",
+            "source": "DBLP author profile",
+            "author_url": best["author_url"],
+            "affiliations": affiliation_text,
+            "evidence": (
+                f"exact canonical name; affiliation score {best['affiliation_score']:.3f}; "
+                f"DBLP affiliation: {affiliation_text}"
+            ),
+            **links,
+        }
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)[:300]}
+
+
+def fetch_dblp_author_identity(
+    author_key: str,
+    name: str,
+    source_affiliations: str,
+) -> Tuple[str, Dict[str, Any]]:
+    identity = dblp_author_identity(make_session(), name, source_affiliations)
+    identity["enrichment_version"] = DBLP_IDENTITY_VERSION
+    identity["attempted_at"] = time.time()
+    return author_key, identity
+
+
+def dblp_identity_cache_reusable(
+    identity: Dict[str, Any],
+    transient_cooldown_seconds: int = 3600,
+) -> bool:
+    if identity.get("enrichment_version") != DBLP_IDENTITY_VERSION:
+        return False
+    if identity.get("status") in {
+            "verified",
+            "not_found",
+            "affiliation_not_matched",
+            "ambiguous_affiliation_match",
+            "ambiguous_name_match",
+    }:
+        return True
+    attempted_at = float(identity.get("attempted_at") or 0)
+    return bool(attempted_at and time.time() - attempted_at < transient_cooldown_seconds)
+
+
+def wikidata_corrected_identity(
+    candidate: Dict[str, Any],
+    wiki: Dict[str, Any],
+) -> Dict[str, str]:
+    if not has_hard_name_correction(candidate):
+        return {}
+    name = str(candidate.get("name") or "")
+    profile_name = str(wiki.get("title") or "")
+    qid = str(wiki.get("wikidata_id") or "")
+    affiliations = str(
+        wiki.get("wikidata_affiliations")
+        or wiki.get("academic_titles")
+        or wiki.get("summary")
+        or ""
+    )
+    score = affiliation_identity_score(
+        str(candidate.get("source_affiliations") or ""),
+        split_identity_candidates(affiliations),
+    )
+    if not qid or not strict_author_name_equivalent(name, profile_name) or score < 0.5:
+        return {}
+    return {
+        "source": "Wikipedia/Wikidata exact-name and affiliation profile",
+        "confidence": "high",
+        "evidence": (
+            f"Wikidata {qid}; exact canonical name; affiliation score {score:.3f}; "
+            f"profile affiliation evidence: {affiliations}"
+        ),
+        "orcid": str(wiki.get("orcid") or ""),
+        "dblp_author_url": str(wiki.get("dblp_author_url") or ""),
+        "google_scholar_profile_url": str(wiki.get("google_scholar_profile_url") or ""),
+        "personal_homepage_url": str(wiki.get("personal_homepage_url") or ""),
+    }
+
+
+def decoded_response_text(response: requests.Response) -> str:
+    content = response.content or b""
+    if content.startswith((b"\xff\xfe", b"\xfe\xff")) or content[:512].count(b"\x00") > 32:
+        try:
+            return content.decode("utf-16")
+        except UnicodeError:
+            pass
+    return response.text
+
+
 def homepage_profile_summary(
     session: requests.Session,
     url: str,
@@ -4638,7 +5313,16 @@ def homepage_profile_summary(
                 "homepage_error": content_type[:120],
                 "enrichment_version": PROFILE_ENRICHMENT_VERSION,
             }
-        soup = BeautifulSoup(response.text[:800000], "html.parser")
+        soup = BeautifulSoup(decoded_response_text(response)[:800000], "html.parser")
+        biography_url = ""
+        for link in soup.find_all("a", href=True):
+            link_text = re.sub(r"\s+", " ", link.get_text(" ", strip=True)).strip()
+            if not re.search(r"\b(?:brief\s+)?bio(?:graphy)?\b|\babout\s+me\b", link_text, re.I):
+                continue
+            candidate_url = urllib.parse.urljoin(response.url or url, link.get("href", ""))
+            if urllib.parse.urlparse(candidate_url).netloc == urllib.parse.urlparse(response.url or url).netloc:
+                biography_url = candidate_url
+                break
         for tag in soup.select("style,script,noscript,svg,nav,footer"):
             tag.decompose()
         title = soup.title.get_text(" ", strip=True) if soup.title else ""
@@ -4656,7 +5340,31 @@ def homepage_profile_summary(
             for item in soup.select("p,li,td")
             if item.get_text(" ", strip=True)
         ][:80]
-        profile_text = " ".join([title, meta_description, " | ".join(headings), " ".join(paragraphs)])
+        linked_profile_text = ""
+        if biography_url and biography_url != (response.url or url):
+            try:
+                biography_response = session.get(
+                    biography_url,
+                    timeout=min(request_timeout, 12),
+                    allow_redirects=True,
+                )
+                if biography_response.ok:
+                    biography_soup = BeautifulSoup(
+                        decoded_response_text(biography_response)[:500000],
+                        "html.parser",
+                    )
+                    for tag in biography_soup.select("style,script,noscript,svg,nav,footer"):
+                        tag.decompose()
+                    linked_profile_text = re.sub(
+                        r"\s+",
+                        " ",
+                        biography_soup.get_text(" ", strip=True),
+                    ).strip()[:12000]
+            except Exception:
+                pass
+        profile_text = " ".join(
+            [title, meta_description, " | ".join(headings), " ".join(paragraphs), linked_profile_text]
+        )
         profile_text = re.sub(r"\s+", " ", profile_text).strip()
         identity = homepage_identity_validation(name, profile_text, affiliations, interests, source_context, response.url or url)
         name_confidence = identity.get("homepage_identity_confidence", "low")
@@ -4901,14 +5609,11 @@ def wikipedia_summary(session: requests.Session, name: str) -> Dict[str, Any]:
             params={"action": "query", "list": "search", "srsearch": name, "format": "json", "srlimit": 8},
             timeout=20,
         )
-        if not search.ok:
-            return {
-                "is_notable": False,
-                "expert_query_status": "wiki_api_error",
-                "expert_rejection_reason": f"wikipedia_search_http_{search.status_code}",
-                "enrichment_version": PROFILE_ENRICHMENT_VERSION,
-            }
-        results = search.json().get("query", {}).get("search", [])
+        if search.ok:
+            results = search.json().get("query", {}).get("search", [])
+        else:
+            results = []
+            rejection_reason = f"wikipedia_search_http_{search.status_code}; trying_wikidata"
         name_norm = normalized_author_name(name)
         for result in results:
             title = result.get("title", "")
@@ -5008,6 +5713,11 @@ def wikipedia_summary(session: requests.Session, name: str) -> Dict[str, Any]:
                 "honors_awards": classified.get("honors_awards", ""),
                 "professional_memberships": classified.get("professional_memberships", ""),
                 "leadership_roles": classified.get("leadership_roles", ""),
+                "wikidata_affiliations": wikidata.get("wikidata_affiliations", ""),
+                "orcid": wikidata.get("orcid", ""),
+                "dblp_author_url": wikidata.get("dblp_author_url", ""),
+                "google_scholar_profile_url": wikidata.get("google_scholar_profile_url", ""),
+                "personal_homepage_url": wikidata.get("personal_homepage_url", ""),
                 "profile_evidence_sources": "; ".join(dict.fromkeys(evidence_sources)),
                 "notability_confidence": match_confidence if is_notable else ("low_evidence" if match_confidence in {"high", "medium"} else "low_match"),
                 "expert_query_status": expert_query_status,
@@ -5046,6 +5756,11 @@ def wikipedia_summary(session: requests.Session, name: str) -> Dict[str, Any]:
                 "honors_awards": classified.get("honors_awards", ""),
                 "professional_memberships": classified.get("professional_memberships", ""),
                 "leadership_roles": classified.get("leadership_roles", ""),
+                "wikidata_affiliations": wikidata.get("wikidata_affiliations", ""),
+                "orcid": wikidata.get("orcid", ""),
+                "dblp_author_url": wikidata.get("dblp_author_url", ""),
+                "google_scholar_profile_url": wikidata.get("google_scholar_profile_url", ""),
+                "personal_homepage_url": wikidata.get("personal_homepage_url", ""),
                 "profile_evidence_sources": "wikidata",
                 "notability_confidence": "medium" if is_notable else "wikidata_profile",
                 "expert_query_status": expert_query_status,
@@ -5171,6 +5886,8 @@ def author_report_row(candidate: Dict[str, Any], wiki: Dict[str, Any]) -> Dict[s
         evidence_sources.append("semantic_scholar/google_scholar_profile")
     if candidate.get("source_affiliations"):
         evidence_sources.append("structured_citing_authorship")
+    if candidate.get("identity_resolution_sources"):
+        evidence_sources.extend(split_evidence_parts(candidate.get("identity_resolution_sources", "")))
     if research_interests:
         evidence_sources.append("google_scholar_profile")
     if homepage_url or (homepage_verified and homepage_evidence):
@@ -5183,7 +5900,8 @@ def author_report_row(candidate: Dict[str, Any], wiki: Dict[str, Any]) -> Dict[s
     is_notable = bool(wiki.get("is_notable") or homepage_notable)
     notable_reason = wiki.get("notable_reason", "") or (homepage.get("notable_reason", "") if homepage_notable else "")
     identity_confidence = (
-        wiki.get("notability_confidence", "")
+        candidate.get("identity_resolution_confidence", "")
+        or wiki.get("notability_confidence", "")
         or homepage.get("homepage_identity_status", "")
         or homepage.get("homepage_name_confidence", "")
         or ("verified_by_authorship" if candidate.get("source_company_affiliations") else "")
@@ -5323,6 +6041,16 @@ def build_paper_author_outputs(
                 "source_affiliations": author.get("source_affiliations", ""),
                 "source_company_affiliations": author.get("source_company_affiliations", ""),
                 "company_affiliation_evidence": author.get("company_affiliation_evidence", ""),
+                "original_names": author.get("original_names", ""),
+                "name_correction_types": author.get("name_correction_types", ""),
+                "name_correction_sources": author.get("name_correction_sources", ""),
+                "name_correction_evidence": author.get("name_correction_evidence", ""),
+                "name_correction_confidence": author.get("name_correction_confidence", ""),
+                "orcid": author.get("orcid", ""),
+                "dblp_author_url": author.get("dblp_author_url", ""),
+                "identity_resolution_sources": author.get("identity_resolution_sources", ""),
+                "identity_resolution_evidence": author.get("identity_resolution_evidence", ""),
+                "identity_resolution_confidence": author.get("identity_resolution_confidence", ""),
                 "is_target_author": is_target,
                 "target_author_match": author.get("target_author_match", ""),
                 "selected_citation_count": author.get("selected_citation_count", ""),
@@ -5432,10 +6160,18 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
         citing_path = output / "citing_papers.csv"
         if not citing_path.exists():
             raise RuntimeError(f"Missing papers in citation_report.xlsx or legacy citing papers: {citing_path}")
-        candidates, papers = collect_author_candidates(citing_path)
-        papers = clean_frame_for_report(papers, PAPER_COLUMNS)
-    else:
-        candidates, papers = collect_author_candidates_from_papers(papers)
+        papers = clean_frame_for_report(pd.read_csv(citing_path, dtype=str).fillna(""), PAPER_COLUMNS)
+    canonical_author_workers = max(1, numeric_arg(args, "canonical_author_workers", 8, int))
+    canonical_author_rps = max(0.1, numeric_arg(args, "canonical_author_rps", 5.0, float))
+    canonical_author_metadata = bool(getattr(args, "canonical_author_metadata", True))
+    papers, canonicalization_stats = canonicalize_citing_authors(
+        output,
+        papers,
+        workers=canonical_author_workers,
+        requests_per_second=canonical_author_rps,
+        enabled=canonical_author_metadata,
+    )
+    candidates, papers = collect_author_candidates_from_papers(papers)
     target = load_target(output)
     target_ids, target_names = target_author_identity(target)
     session = make_session()
@@ -5479,8 +6215,9 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
         candidate["profile_query_status"] = "queried" if candidate["author_key"] in profile_keys else "not_queried_profile_limit"
         cache_key = author_metric_cache_key(candidate, candidate["name"])
         cached_metric = s2_cache.get(cache_key) or {}
+        cached_identity_valid = cached_s2_author_identity_valid(candidate, cached_metric)
         if candidate["author_key"] in profile_keys and (
-            cache_key not in s2_cache or cached_metric.get("retryable")
+            cache_key not in s2_cache or cached_metric.get("retryable") or not cached_identity_valid
         ):
             metric_jobs.append((cache_key, candidate.copy()))
     queried_profiles = len(profile_keys)
@@ -5731,12 +6468,72 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     for rank, candidate in enumerate(non_target_enriched, 1):
         candidate["rank"] = rank
 
+    dblp_targets = [candidate for candidate in non_target_enriched if has_hard_name_correction(candidate)]
+    dblp_jobs = [
+        (candidate["author_key"], candidate["name"], candidate.get("source_affiliations", ""))
+        for candidate in dblp_targets
+        if not dblp_identity_cache_reusable(
+            wiki_cache.get(candidate["author_key"], {}).get("dblp_identity", {})
+        )
+    ]
+    if dblp_jobs:
+        if wiki_workers > 1:
+            completed = 0
+            with ThreadPoolExecutor(max_workers=min(wiki_workers, len(dblp_jobs))) as executor:
+                futures = {
+                    executor.submit(fetch_dblp_author_identity, key, name, affiliations): key
+                    for key, name, affiliations in dblp_jobs
+                }
+                for future in as_completed(futures):
+                    key = futures[future]
+                    try:
+                        _, identity = future.result()
+                    except Exception as exc:
+                        identity = {
+                            "status": "error",
+                            "error": str(exc)[:300],
+                            "enrichment_version": DBLP_IDENTITY_VERSION,
+                        }
+                    wiki_cache.setdefault(key, {})["dblp_identity"] = identity
+                    completed += 1
+                    if completed % 10 == 0 or completed == len(dblp_jobs):
+                        print(f"DBLP corrected-name identities fetched: {completed}/{len(dblp_jobs)}")
+        else:
+            for completed, (key, name, affiliations) in enumerate(dblp_jobs, 1):
+                _, identity = fetch_dblp_author_identity(key, name, affiliations)
+                wiki_cache.setdefault(key, {})["dblp_identity"] = identity
+                if completed % 10 == 0 or completed == len(dblp_jobs):
+                    print(f"DBLP corrected-name identities fetched: {completed}/{len(dblp_jobs)}")
+    dblp_verified = 0
+    for candidate in dblp_targets:
+        identity = wiki_cache.get(candidate["author_key"], {}).get("dblp_identity", {})
+        if identity.get("status") != "verified":
+            continue
+        dblp_verified += 1
+        candidate["dblp_author_url"] = identity.get("author_url", "")
+        candidate["identity_resolution_sources"] = identity.get("source", "")
+        candidate["identity_resolution_evidence"] = identity.get("evidence", "")
+        candidate["identity_resolution_confidence"] = identity.get("confidence", "")
+        if identity.get("personal_homepage_url"):
+            candidate["personal_homepage_url"] = identity["personal_homepage_url"]
+        if identity.get("orcid") and not candidate.get("orcid"):
+            candidate["orcid"] = identity["orcid"]
+        if identity.get("google_scholar_profile_url") and not candidate.get("google_scholar_profile_url"):
+            candidate["google_scholar_profile_url"] = identity["google_scholar_profile_url"]
+
     wiki_by_key: Dict[str, Dict[str, Any]] = {}
     expert_rank_limit = max(0, top_n)
     top_paper_author_keys = top_author_keys_for_papers(papers, enriched)
     target_keys: List[str] = []
     seen_target_keys: set[str] = set()
     by_key = {candidate["author_key"]: candidate for candidate in non_target_enriched}
+    for candidate in non_target_enriched:
+        if not has_hard_name_correction(candidate):
+            continue
+        key = candidate["author_key"]
+        if key not in seen_target_keys:
+            target_keys.append(key)
+            seen_target_keys.add(key)
     breadth_budget = min(expert_rank_limit, max(1, expert_rank_limit // 3)) if expert_rank_limit else 0
     for key in top_paper_author_keys[:breadth_budget]:
         if key in by_key and key not in seen_target_keys:
@@ -5757,7 +6554,10 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     wiki_jobs = [
         (candidate["author_key"], candidate["name"])
         for candidate in wiki_targets
-        if wiki_cache.get(candidate["author_key"], {}).get("enrichment_version") != PROFILE_ENRICHMENT_VERSION
+        if (
+            wiki_cache.get(candidate["author_key"], {}).get("enrichment_version") != PROFILE_ENRICHMENT_VERSION
+            or wiki_cache.get(candidate["author_key"], {}).get("expert_query_status") == "wiki_api_error"
+        )
     ]
     if wiki_jobs:
         if wiki_workers > 1:
@@ -5782,6 +6582,26 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
                 wiki_cache[key] = wikipedia_summary(make_session(), name)
                 if completed % 10 == 0 or completed == len(wiki_jobs):
                     print(f"Wikipedia/Wikidata profiles fetched: {completed}/{len(wiki_jobs)}")
+    for candidate in wiki_targets:
+        if candidate.get("identity_resolution_confidence") == "high":
+            continue
+        identity = wikidata_corrected_identity(
+            candidate,
+            wiki_cache.get(candidate["author_key"], {}),
+        )
+        if not identity:
+            continue
+        candidate["identity_resolution_sources"] = identity["source"]
+        candidate["identity_resolution_evidence"] = identity["evidence"]
+        candidate["identity_resolution_confidence"] = identity["confidence"]
+        for field in (
+            "orcid",
+            "dblp_author_url",
+            "google_scholar_profile_url",
+            "personal_homepage_url",
+        ):
+            if identity.get(field) and not candidate.get(field):
+                candidate[field] = identity[field]
     homepage_jobs = []
     for candidate in wiki_targets:
         key = candidate["author_key"]
@@ -6000,9 +6820,24 @@ def enrich_authors(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
             "authors.total_candidates": len(enriched),
             "authors.pass_number": previous_pass_count + 1,
             "authors.new_verified_people_this_pass": new_verified_people,
+            "authors.canonicalization.enabled": canonicalization_stats.get("enabled", False),
+            "authors.canonicalization.doi_rows": canonicalization_stats.get("doi_rows", 0),
+            "authors.canonicalization.queried_dois": canonicalization_stats.get("queried_dois", 0),
+            "authors.canonicalization.corrected_papers": canonicalization_stats.get("corrected_papers", 0),
+            "authors.canonicalization.corrections": canonicalization_stats.get("corrections", 0),
+            "authors.canonicalization.affiliation_enriched_papers": canonicalization_stats.get("affiliation_enriched_papers", 0),
+            "authors.canonicalization.title_mismatches": canonicalization_stats.get("title_mismatches", 0),
+            "authors.canonicalization.author_count_mismatches": canonicalization_stats.get("author_count_mismatches", 0),
+            "authors.canonicalization.insufficient_alignment": canonicalization_stats.get("insufficient_alignment", 0),
+            "authors.canonicalization.workers": canonical_author_workers,
+            "authors.canonicalization.rps": canonical_author_rps,
             "authors.non_target_candidates": len(non_target_enriched),
             "authors.target_authors_excluded": sum(1 for item in enriched if item.get("is_target_author")),
             "authors.profile_queries": queried_profiles,
+            "authors.hard_name_corrections_prioritized": sum(
+                1 for item in non_target_enriched if has_hard_name_correction(item)
+            ),
+            "authors.dblp_identity_verified": dblp_verified,
             "authors.semantic_scholar_workers": author_workers,
             "authors.failure_policy": author_failure_policy,
             "authors.semantic_scholar_circuit_open": s2_circuit_open,
@@ -7016,6 +7851,9 @@ def cmd_run(args: argparse.Namespace) -> None:
         homepage_search_limit=args.homepage_search_limit,
         author_quality_scope=args.author_quality_scope,
         author_failure_policy=args.author_failure_policy,
+        canonical_author_metadata=args.canonical_author_metadata,
+        canonical_author_workers=args.canonical_author_workers,
+        canonical_author_rps=args.canonical_author_rps,
         skip_google_scholar_authors=getattr(args, "skip_google_scholar_authors", False),
         export_legacy_csv=args.export_legacy_csv,
     )
@@ -7100,6 +7938,9 @@ def add_common_author_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--s2-api-key-env", default="SEMANTIC_SCHOLAR_API_KEY")
     parser.add_argument("--author-workers", type=int, default=8, help="Parallel Semantic Scholar author profile workers (default: 8)")
     parser.add_argument("--author-failure-policy", choices=["skip", "retry"], default="skip", help="Probe and circuit-break the Semantic Scholar author source on temporary failures, or retry (default: skip)")
+    parser.add_argument("--canonical-author-metadata", action=argparse.BooleanOptionalAction, default=True, help="Reconcile citing-paper author names and affiliations against DOI metadata (default: enabled)")
+    parser.add_argument("--canonical-author-workers", type=int, default=8, help="Concurrent Crossref author-metadata workers (default: 8)")
+    parser.add_argument("--canonical-author-rps", type=float, default=5.0, help="Maximum Crossref author-metadata request starts per second (default: 5)")
     parser.add_argument("--wiki-workers", type=int, default=4, help="Parallel Wikipedia/Wikidata/homepage workers (default: 4)")
     parser.add_argument("--homepage-search-limit", type=int, default=250, help="Maximum expert-scope authors to search for personal/school homepages when profiles do not provide one (default: 250)")
     parser.add_argument("--author-quality-scope", choices=["high-value", "elite", "high-impact", "all-notable"], default="high-impact", help="Core citation rows: elite awards, academy/IEEE Fellows, major-company authors, and verified high-impact scholars by default")
@@ -7166,6 +8007,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--max-author-profiles", type=int, default=1000, help="Maximum author profiles to query across Semantic Scholar and Google Scholar (default: 1000)")
     run_p.add_argument("--author-workers", type=int, default=8, help="Parallel Semantic Scholar author profile workers (default: 8)")
     run_p.add_argument("--author-failure-policy", choices=["skip", "retry"], default="skip", help="Probe and circuit-break the Semantic Scholar author source on temporary failures, or retry (default: skip)")
+    run_p.add_argument("--canonical-author-metadata", action=argparse.BooleanOptionalAction, default=True, help="Reconcile citing-paper author names and affiliations against DOI metadata (default: enabled)")
+    run_p.add_argument("--canonical-author-workers", type=int, default=8, help="Concurrent Crossref author-metadata workers (default: 8)")
+    run_p.add_argument("--canonical-author-rps", type=float, default=5.0, help="Maximum Crossref author-metadata request starts per second (default: 5)")
     run_p.add_argument("--wiki-workers", type=int, default=4, help="Parallel Wikipedia/Wikidata/homepage workers (default: 4)")
     run_p.add_argument("--homepage-search-limit", type=int, default=250, help="Maximum expert-scope authors to search for personal/school homepages when profiles do not provide one (default: 250)")
     run_p.add_argument("--author-quality-scope", choices=["high-value", "elite", "high-impact", "all-notable"], default="high-impact", help="Core citation rows: elite awards, academy/IEEE Fellows, major-company authors, and verified high-impact scholars by default")
